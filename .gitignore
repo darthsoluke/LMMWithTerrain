@@ -26,3 +26,7 @@ pfnn_lmm_aligned_full_v3/resources/
 pfnn_lmm_aligned_proto5000_v3/logs/
 pfnn_lmm_aligned_proto5000_v3/resources/
 pfnn_lmm_*/controller*
+!pfnn_lmm_aligned_full_v3/resources/
+pfnn_lmm_aligned_full_v3/resources/*
+!pfnn_lmm_aligned_full_v3/resources/*.bin
+!pfnn_lmm_aligned_full_v3/resources/environment_boxes.txt
