@@ -9,6 +9,8 @@
 #include <float.h>
 #include <stdio.h>
 #include <math.h>
+#include <algorithm>
+#include <vector>
 
 //--------------------------------------
 
@@ -39,6 +41,9 @@ struct database
     array2d<float> bound_sm_max;
     array2d<float> bound_lr_min;
     array2d<float> bound_lr_max;
+
+    array1d<bool> searchable_frames;
+    float root_speed_limit = 5.0f;
     
     int nframes() const { return bone_positions.rows; }
     int nbones() const { return bone_positions.cols; }
@@ -46,6 +51,124 @@ struct database
     int nfeatures() const { return features.cols; }
     int ncontacts() const { return contact_states.cols; }
 };
+
+static inline float database_root_planar_speed(const database& db, const int frame)
+{
+    vec3 velocity = db.bone_velocities(frame, 0);
+    return sqrtf(squaref(velocity.x) + squaref(velocity.z));
+}
+
+void database_build_search_mask(
+    database& db,
+    const int ignore_range_start = 20,
+    const int ignore_range_end = 20,
+    const float speed_quantile = 0.9999f,
+    const float speed_quantile_scale = 1.25f,
+    const float min_root_speed_limit = 4.0f,
+    const float max_root_speed_limit = 6.0f)
+{
+    if (db.nframes() == 0)
+    {
+        db.searchable_frames.resize(0);
+        db.root_speed_limit = max_root_speed_limit;
+        return;
+    }
+
+    std::vector<float> root_speeds(db.nframes());
+    for (int i = 0; i < db.nframes(); i++)
+    {
+        root_speeds[i] = database_root_planar_speed(db, i);
+    }
+
+    std::vector<float> sorted_speeds = root_speeds;
+    int quantile_index = clamp(
+        (int)(speed_quantile * ((int)sorted_speeds.size() - 1)),
+        0,
+        (int)sorted_speeds.size() - 1);
+    std::nth_element(
+        sorted_speeds.begin(),
+        sorted_speeds.begin() + quantile_index,
+        sorted_speeds.end());
+
+    float quantile_speed = sorted_speeds[quantile_index];
+    db.root_speed_limit = clampf(
+        speed_quantile_scale * quantile_speed,
+        min_root_speed_limit,
+        max_root_speed_limit);
+
+    db.searchable_frames.resize(db.nframes());
+    db.searchable_frames.set(true);
+
+    for (int i = 0; i < db.nframes(); i++)
+    {
+        if (root_speeds[i] > db.root_speed_limit)
+        {
+            db.searchable_frames(i) = false;
+        }
+    }
+
+    for (int r = 0; r < db.nranges(); r++)
+    {
+        int start = db.range_starts(r);
+        int stop = db.range_stops(r);
+
+        for (int i = start; i < std::min(stop, start + ignore_range_start); i++)
+        {
+            db.searchable_frames(i) = false;
+        }
+
+        for (int i = std::max(start, stop - ignore_range_end); i < stop; i++)
+        {
+            db.searchable_frames(i) = false;
+        }
+    }
+}
+
+int database_find_first_searchable_frame(database& db, const int range_index = 0)
+{
+    int start = db.range_starts(range_index);
+    int stop = db.range_stops(range_index);
+
+    if (db.searchable_frames.size == db.nframes())
+    {
+        for (int i = start; i < stop; i++)
+        {
+            if (db.searchable_frames(i))
+            {
+                return i;
+            }
+        }
+    }
+
+    return start;
+}
+
+int database_advance_frame(database& db, const int frame)
+{
+    for (int r = 0; r < db.nranges(); r++)
+    {
+        int start = db.range_starts(r);
+        int stop = db.range_stops(r);
+
+        if (frame >= start && frame < stop)
+        {
+            int next = clamp(frame + 1, start, stop - 1);
+
+            if (db.searchable_frames.size == db.nframes())
+            {
+                while (next < stop - 1 && !db.searchable_frames(next))
+                {
+                    next++;
+                }
+            }
+
+            return next;
+        }
+    }
+
+    assert(false);
+    return frame;
+}
 
 void database_load(database& db, const char* filename)
 {
@@ -64,6 +187,8 @@ void database_load(database& db, const char* filename)
     array2d_read(db.contact_states, f);
     
     fclose(f);
+
+    database_build_search_mask(db);
 }
 
 void database_save_matching_features(const database& db, const char* filename)
@@ -620,6 +745,7 @@ void motion_matching_search(
     float& __restrict__ best_cost, 
     const slice1d<int> range_starts,
     const slice1d<int> range_stops,
+    const slice1d<bool> searchable_frames,
     const slice2d<float> features,
     const slice1d<float> features_offset,
     const slice1d<float> features_scale,
@@ -712,6 +838,12 @@ void motion_matching_search(
                 // Search inside small box
                 while (i < i_sm_next && i < range_end)
                 {
+                    if (searchable_frames.data != NULL && !searchable_frames(i))
+                    {
+                        i++;
+                        continue;
+                    }
+
                     // Skip surrounding frames
                     if (curr_index != - 1 && abs(i - curr_index) < ignore_surrounding)
                     {
@@ -767,6 +899,7 @@ void database_search(
         best_cost, 
         db.range_starts,
         db.range_stops,
+        db.searchable_frames,
         db.features,
         db.features_offset,
         db.features_scale,

@@ -27,6 +27,42 @@ static inline Vector3 to_Vector3(vec3 v)
     return (Vector3){ v.x, v.y, v.z };
 }
 
+static inline vec3 planar_velocity(vec3 v)
+{
+    return vec3(v.x, 0.0f, v.z);
+}
+
+static inline float planar_speed(vec3 v)
+{
+    return length(planar_velocity(v));
+}
+
+static inline vec3 clamp_planar_speed(vec3 v, float max_speed, const float eps = 1e-4f)
+{
+    vec3 planar = planar_velocity(v);
+    float speed = length(planar);
+
+    if (speed <= max_speed)
+    {
+        return planar;
+    }
+
+    return max_speed > eps ? normalize(planar) * max_speed : vec3();
+}
+
+static inline void damp_array_exact(
+    slice1d<float> values,
+    const slice1d<float> goals,
+    const float halflife,
+    const float dt)
+{
+    assert(values.size == goals.size);
+    for (int i = 0; i < values.size; i++)
+    {
+        values(i) = damper_exact(values(i), goals(i), halflife, dt);
+    }
+}
+
 struct environment_box
 {
     vec3 position;
@@ -605,6 +641,69 @@ vec3 desired_velocity_update(
     
     // Re-orientate into the world space
     return quat_mul_vec3(simulation_rotation, local_desired_velocity);
+}
+
+vec3 simulation_desired_velocity_update(
+    const vec3 desired_velocity,
+    const vec3 animation_velocity,
+    const bool follow_animation_speed,
+    const float max_animation_speed,
+    const float input_deadzone = 0.01f,
+    const float speed_epsilon = 1e-4f)
+{
+    if (!follow_animation_speed)
+    {
+        return desired_velocity;
+    }
+
+    vec3 desired_planar_velocity = planar_velocity(desired_velocity);
+    vec3 animation_planar_velocity = clamp_planar_speed(animation_velocity, max_animation_speed);
+    float animation_root_speed = planar_speed(animation_velocity);
+    animation_root_speed = minf(animation_root_speed, max_animation_speed);
+
+    if (length(desired_planar_velocity) > input_deadzone)
+    {
+        return animation_root_speed > speed_epsilon ?
+            normalize(desired_planar_velocity) * animation_root_speed :
+            vec3();
+    }
+
+    return animation_root_speed > speed_epsilon ? animation_planar_velocity : vec3();
+}
+
+void locomotion_request_speeds_update(
+    float& fwrd_speed,
+    float& side_speed,
+    float& back_speed,
+    const float desired_gait,
+    const bool follow_animation_speed,
+    const float manual_run_fwrd_speed,
+    const float manual_run_side_speed,
+    const float manual_run_back_speed,
+    const float manual_walk_fwrd_speed,
+    const float manual_walk_side_speed,
+    const float manual_walk_back_speed)
+{
+    if (follow_animation_speed)
+    {
+        // Keep follow mode inside the speed range this database actually uses
+        // so the query asks for locomotion intent, not arbitrary root speeds.
+        const float follow_run_fwrd_speed = 2.2f;
+        const float follow_run_side_speed = 1.7f;
+        const float follow_run_back_speed = 1.35f;
+        const float follow_walk_fwrd_speed = 1.1f;
+        const float follow_walk_side_speed = 0.9f;
+        const float follow_walk_back_speed = 0.75f;
+
+        fwrd_speed = lerpf(follow_run_fwrd_speed, follow_walk_fwrd_speed, desired_gait);
+        side_speed = lerpf(follow_run_side_speed, follow_walk_side_speed, desired_gait);
+        back_speed = lerpf(follow_run_back_speed, follow_walk_back_speed, desired_gait);
+        return;
+    }
+
+    fwrd_speed = lerpf(manual_run_fwrd_speed, manual_walk_fwrd_speed, desired_gait);
+    side_speed = lerpf(manual_run_side_speed, manual_walk_side_speed, desired_gait);
+    back_speed = lerpf(manual_run_back_speed, manual_walk_back_speed, desired_gait);
 }
 
 quat desired_rotation_update(
@@ -1860,7 +1959,7 @@ int main(void)
    
     // Pose & Inertializer Data
     
-    int frame_index = db.range_starts(0);
+    int frame_index = database_find_first_searchable_frame(db, 0);
     float inertialize_blending_halflife = 0.1f;
 
     array1d<vec3> curr_bone_positions = db.bone_positions(frame_index);
@@ -1933,6 +2032,7 @@ int main(void)
     float search_time = 0.1f;
     float search_timer = search_time;
     float force_search_timer = search_time;
+    float motion_matching_transition_cost = 0.10f;
     
     vec3 desired_velocity;
     vec3 desired_velocity_change_curr;
@@ -1956,7 +2056,8 @@ int main(void)
     float simulation_velocity_halflife = 0.27f;
     float simulation_rotation_halflife = 0.27f;
     
-    // All speeds in m/s
+    // Query/request speeds in m/s. When enabled below, root motion follows
+    // the matched animation speed instead of these values directly.
     float simulation_run_fwrd_speed = 4.0f;
     float simulation_run_side_speed = 3.0f;
     float simulation_run_back_speed = 2.5f;
@@ -1964,6 +2065,9 @@ int main(void)
     float simulation_walk_fwrd_speed = 1.75f;
     float simulation_walk_side_speed = 1.5f;
     float simulation_walk_back_speed = 1.25f;
+    bool simulation_follow_animation_speed = true;
+    float lmm_projector_transition_threshold = 0.10f;
+    float lmm_projector_blend_halflife = 0.06f;
     
     array1d<vec3> trajectory_desired_velocities(4);
     array1d<quat> trajectory_desired_rotations(4);
@@ -2076,6 +2180,8 @@ int main(void)
     array1d<float> features_curr = db.features(frame_index);
     array1d<float> latent_proj(32); latent_proj.zero();
     array1d<float> latent_curr(32); latent_curr.zero();
+    array1d<float> debug_query_features = db.features(frame_index);
+    denormalize_features(debug_query_features, db.features_offset, db.features_scale);
     
     // Go
 
@@ -2133,10 +2239,22 @@ int main(void)
             desired_gait_velocity,
             dt);
         
-        // Get the desired simulation speeds based on the gait
-        float simulation_fwrd_speed = lerpf(simulation_run_fwrd_speed, simulation_walk_fwrd_speed, desired_gait);
-        float simulation_side_speed = lerpf(simulation_run_side_speed, simulation_walk_side_speed, desired_gait);
-        float simulation_back_speed = lerpf(simulation_run_back_speed, simulation_walk_back_speed, desired_gait);
+        // Get the desired query/request speeds based on the gait
+        float simulation_fwrd_speed = 0.0f;
+        float simulation_side_speed = 0.0f;
+        float simulation_back_speed = 0.0f;
+        locomotion_request_speeds_update(
+            simulation_fwrd_speed,
+            simulation_side_speed,
+            simulation_back_speed,
+            desired_gait,
+            simulation_follow_animation_speed,
+            simulation_run_fwrd_speed,
+            simulation_run_side_speed,
+            simulation_run_back_speed,
+            simulation_walk_fwrd_speed,
+            simulation_walk_side_speed,
+            simulation_walk_back_speed);
         
         // Get the desired velocity
         vec3 desired_velocity_curr = desired_velocity_update(
@@ -2258,132 +2376,87 @@ int main(void)
         }
         
         assert(offset == db.nfeatures());
+        debug_query_features = query;
 
         // Check if we reached the end of the current anim
         bool end_of_anim = database_trajectory_index_clamp(db, frame_index, 1) == frame_index;
         
+        bool lmm_reproject_enabled = lmm_enabled && lmm_networks_compatible;
+
         // Do we need to search?
-        if (force_search || search_timer <= 0.0f || end_of_anim)
+        if (lmm_reproject_enabled)
         {
-            if (lmm_enabled && lmm_networks_compatible)
+            float best_cost = FLT_MAX;
+            bool transition = false;
+
+            projector_evaluate(
+                transition,
+                best_cost,
+                features_proj,
+                latent_proj,
+                projector_evaluation,
+                query,
+                db.features_offset,
+                db.features_scale,
+                features_curr,
+                projector,
+                lmm_projector_transition_threshold);
+
+            if (transition)
             {
-                // Project query onto nearest feature vector
-                
-                float best_cost = FLT_MAX;
-                bool transition = false;
-                
-                projector_evaluate(
-                    transition,
-                    best_cost,
-                    features_proj,
-                    latent_proj,
-                    projector_evaluation,
-                    query,
-                    db.features_offset,
-                    db.features_scale,
-                    features_curr,
-                    projector);
-                
-                // If projection is sufficiently different from current
-                if (transition)
-                {   
-                    // Evaluate pose for projected features
-                    decompressor_evaluate(
-                        trns_bone_positions,
-                        trns_bone_velocities,
-                        trns_bone_rotations,
-                        trns_bone_angular_velocities,
-                        trns_bone_contacts,
-                        decompressor_evaluation,
-                        features_proj,
-                        latent_proj,
-                        curr_bone_positions(0),
-                        curr_bone_rotations(0),
-                        decompressor,
-                        dt);
-                    
-                    // Transition inertializer to this pose
-                    inertialize_pose_transition(
-                        bone_offset_positions,
-                        bone_offset_velocities,
-                        bone_offset_rotations,
-                        bone_offset_angular_velocities,
-                        transition_src_position,
-                        transition_src_rotation,
-                        transition_dst_position,
-                        transition_dst_rotation,
-                        bone_positions(0),
-                        bone_velocities(0),
-                        bone_rotations(0),
-                        bone_angular_velocities(0),
-                        curr_bone_positions,
-                        curr_bone_velocities,
-                        curr_bone_rotations,
-                        curr_bone_angular_velocities,
-                        trns_bone_positions,
-                        trns_bone_velocities,
-                        trns_bone_rotations,
-                        trns_bone_angular_velocities);
-                    
-                    // Update current features and latents
-                    features_curr = features_proj;
-                    latent_curr = latent_proj;
-                }
+                damp_array_exact(features_curr, features_proj, lmm_projector_blend_halflife, dt);
+                damp_array_exact(latent_curr, latent_proj, lmm_projector_blend_halflife, dt);
             }
-            else
+        }
+        else
+        {
+            // Search
+            
+            int best_index = end_of_anim ? -1 : frame_index;
+            float best_cost = FLT_MAX;
+            
+            database_search(
+                best_index,
+                best_cost,
+                db,
+                query,
+                motion_matching_transition_cost);
+            
+            // Transition if better frame found
+            
+            if (best_index != frame_index)
             {
-                // Search
+                trns_bone_positions = db.bone_positions(best_index);
+                trns_bone_velocities = db.bone_velocities(best_index);
+                trns_bone_rotations = db.bone_rotations(best_index);
+                trns_bone_angular_velocities = db.bone_angular_velocities(best_index);
                 
-                int best_index = end_of_anim ? -1 : frame_index;
-                float best_cost = FLT_MAX;
+                inertialize_pose_transition(
+                    bone_offset_positions,
+                    bone_offset_velocities,
+                    bone_offset_rotations,
+                    bone_offset_angular_velocities,
+                    transition_src_position,
+                    transition_src_rotation,
+                    transition_dst_position,
+                    transition_dst_rotation,
+                    bone_positions(0),
+                    bone_velocities(0),
+                    bone_rotations(0),
+                    bone_angular_velocities(0),
+                    curr_bone_positions,
+                    curr_bone_velocities,
+                    curr_bone_rotations,
+                    curr_bone_angular_velocities,
+                    trns_bone_positions,
+                    trns_bone_velocities,
+                    trns_bone_rotations,
+                    trns_bone_angular_velocities);
                 
-                database_search(
-                    best_index,
-                    best_cost,
-                    db,
-                    query);
-                
-                // Transition if better frame found
-                
-                if (best_index != frame_index)
-                {
-                    trns_bone_positions = db.bone_positions(best_index);
-                    trns_bone_velocities = db.bone_velocities(best_index);
-                    trns_bone_rotations = db.bone_rotations(best_index);
-                    trns_bone_angular_velocities = db.bone_angular_velocities(best_index);
-                    
-                    inertialize_pose_transition(
-                        bone_offset_positions,
-                        bone_offset_velocities,
-                        bone_offset_rotations,
-                        bone_offset_angular_velocities,
-                        transition_src_position,
-                        transition_src_rotation,
-                        transition_dst_position,
-                        transition_dst_rotation,
-                        bone_positions(0),
-                        bone_velocities(0),
-                        bone_rotations(0),
-                        bone_angular_velocities(0),
-                        curr_bone_positions,
-                        curr_bone_velocities,
-                        curr_bone_rotations,
-                        curr_bone_angular_velocities,
-                        trns_bone_positions,
-                        trns_bone_velocities,
-                        trns_bone_rotations,
-                        trns_bone_angular_velocities);
-                    
-                    frame_index = best_index;
-                }
+                frame_index = best_index;
             }
 
-            // Reset search timer
-            search_timer = search_time;
         }
-        
-        // Tick down search timer
-        search_timer -= dt;
 
         if (lmm_enabled && lmm_networks_compatible)
         {
@@ -2413,7 +2486,7 @@ int main(void)
         else
         {
             // Tick frame
-            frame_index++; // Assumes dt is fixed to 60fps
+            frame_index = database_advance_frame(db, frame_index);
             
             // Look-up Next Pose
             curr_bone_positions = db.bone_positions(frame_index);
@@ -2448,12 +2521,20 @@ int main(void)
         // Update Simulation
         
         vec3 simulation_position_prev = simulation_position;
+        vec3 animation_root_velocity_control = clamp_planar_speed(
+            bone_velocities(0),
+            db.root_speed_limit);
+        vec3 simulation_desired_velocity = simulation_desired_velocity_update(
+            desired_velocity,
+            animation_root_velocity_control,
+            simulation_follow_animation_speed,
+            db.root_speed_limit);
         
         simulation_positions_update(
             simulation_position, 
             simulation_velocity, 
             simulation_acceleration,
-            desired_velocity,
+            simulation_desired_velocity,
             simulation_velocity_halflife,
             dt,
             environment_boxes);
@@ -2510,7 +2591,7 @@ int main(void)
             {
                 adjusted_position = adjust_character_position_by_velocity(
                     bone_positions(0),
-                    bone_velocities(0),
+                    animation_root_velocity_control,
                     simulation_position,
                     adjustment_position_max_ratio,
                     adjustment_position_halflife,
@@ -2844,11 +2925,9 @@ int main(void)
                 vec3(0.35f, 0.0f, 0.0f));
         }
         
-        // Draw matched features
-        
-        array1d<float> current_features = lmm_enabled ? slice1d<float>(features_curr) : db.features(frame_index);
-        denormalize_features(current_features, db.features_offset, db.features_scale);        
-        draw_features(current_features, bone_positions(0), bone_rotations(0), MAROON);
+        // Draw current query features so the trajectory/environment preview
+        // stays continuous even when the matched frame changes discretely.
+        draw_features(debug_query_features, bone_positions(0), bone_rotations(0), MAROON);
         
         // Draw Simuation Bone
         
@@ -2871,6 +2950,10 @@ int main(void)
         float ui_sim_hei = 20;
         
         GuiGroupBox((Rectangle){ 970, ui_sim_hei, 290, 250 }, "simulation object");
+        GuiCheckBox(
+            (Rectangle){ 990, ui_sim_hei + 10, 20, 20 },
+            "follow anim speed",
+            &simulation_follow_animation_speed);
 
         GuiSliderBar(
             (Rectangle){ 1100, ui_sim_hei + 10, 120, 20 }, 
@@ -2886,37 +2969,37 @@ int main(void)
             
         GuiSliderBar(
             (Rectangle){ 1100, ui_sim_hei + 70, 120, 20 }, 
-            "run forward speed", 
+            "run forward request", 
             TextFormat("%5.3f", simulation_run_fwrd_speed), 
             &simulation_run_fwrd_speed, 0.0f, 10.0f);
         
         GuiSliderBar(
             (Rectangle){ 1100, ui_sim_hei + 100, 120, 20 }, 
-            "run sideways speed", 
+            "run sideways request", 
             TextFormat("%5.3f", simulation_run_side_speed), 
             &simulation_run_side_speed, 0.0f, 10.0f);
         
         GuiSliderBar(
             (Rectangle){ 1100, ui_sim_hei + 130, 120, 20 }, 
-            "run backwards speed", 
+            "run backwards request", 
             TextFormat("%5.3f", simulation_run_back_speed), 
             &simulation_run_back_speed, 0.0f, 10.0f);
         
         GuiSliderBar(
             (Rectangle){ 1100, ui_sim_hei + 160, 120, 20 }, 
-            "walk forward speed", 
+            "walk forward request", 
             TextFormat("%5.3f", simulation_walk_fwrd_speed), 
             &simulation_walk_fwrd_speed, 0.0f, 5.0f);
         
         GuiSliderBar(
             (Rectangle){ 1100, ui_sim_hei + 190, 120, 20 }, 
-            "walk sideways speed", 
+            "walk sideways request", 
             TextFormat("%5.3f", simulation_walk_side_speed), 
             &simulation_walk_side_speed, 0.0f, 5.0f);
         
         GuiSliderBar(
             (Rectangle){ 1100, ui_sim_hei + 220, 120, 20 }, 
-            "walk backwards speed", 
+            "walk backwards request", 
             TextFormat("%5.3f", simulation_walk_back_speed), 
             &simulation_walk_back_speed, 0.0f, 5.0f);
         
@@ -2936,12 +3019,22 @@ int main(void)
         
         float ui_lmm_hei = 330;
         
-        GuiGroupBox((Rectangle){ 970, ui_lmm_hei, 290, 40 }, "learned motion matching");
+        GuiGroupBox((Rectangle){ 970, ui_lmm_hei, 290, 65 }, "learned motion matching");
         
         GuiCheckBox(
             (Rectangle){ 1000, ui_lmm_hei + 10, 20, 20 }, 
             "enabled",
             &lmm_enabled);
+        GuiSliderBar(
+            (Rectangle){ 1110, ui_lmm_hei + 10, 110, 20 },
+            "threshold",
+            TextFormat("%5.3f", lmm_projector_transition_threshold),
+            &lmm_projector_transition_threshold, 0.0f, 0.5f);
+        GuiSliderBar(
+            (Rectangle){ 1110, ui_lmm_hei + 35, 110, 20 },
+            "blend halflife",
+            TextFormat("%5.3f", lmm_projector_blend_halflife),
+            &lmm_projector_blend_halflife, 0.01f, 0.3f);
         if (!lmm_networks_compatible)
         {
             GuiLabel((Rectangle){ 1065, ui_lmm_hei + 10, 185, 20 }, "retrain nets for env sdf");
