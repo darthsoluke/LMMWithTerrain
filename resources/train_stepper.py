@@ -1,5 +1,6 @@
 import sys
 import struct
+import argparse
 
 import numpy as np
 import tquat
@@ -12,7 +13,21 @@ import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.tensorboard import SummaryWriter
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except ModuleNotFoundError:
+    class SummaryWriter:  # type: ignore[override]
+        def add_scalar(self, *args, **kwargs):
+            pass
+
+        def add_scalars(self, *args, **kwargs):
+            pass
+
+        def flush(self):
+            pass
+
+        def close(self):
+            pass
 
 from train_common import load_database, load_features, load_latent, save_network
 
@@ -34,7 +49,18 @@ class Stepper(nn.Module):
 
 # Training procedure
 
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--device', default=None)
+    parser.add_argument('--gpu', type=int, default=0)
+    parser.add_argument('--batchsize', type=int, default=32)
+    parser.add_argument('--niter', type=int, default=100000)
+    parser.add_argument('--save-every', type=int, default=1000)
+    parser.add_argument('--lr', type=float, default=0.001)
+    return parser.parse_args()
+
 if __name__ == '__main__':
+    args = parse_args()
     
     # Load data
     
@@ -53,15 +79,27 @@ if __name__ == '__main__':
     # Parameters
     
     seed = 1234
-    batchsize = 32
-    lr = 0.001
-    niter = 500000
+    batchsize = args.batchsize
+    lr = args.lr
+    niter = args.niter
     window = 20
     dt = 1.0 / 60.0
-    
+
+    if args.device is not None:
+        device = torch.device(args.device)
+    elif torch.cuda.is_available():
+        device = torch.device(f'cuda:{args.gpu}')
+    else:
+        device = torch.device('cpu')
+
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.set_num_threads(1)
+    if device.type == 'cuda':
+        torch.cuda.set_device(device)
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+    print(f'Using device: {device}')
     
     # Compute means/stds
     
@@ -71,22 +109,22 @@ if __name__ == '__main__':
     stepper_mean_out = torch.as_tensor(np.hstack([
         ((X[1:] - X[:-1]) / dt).mean(axis=0).ravel(),
         ((Z[1:] - Z[:-1]) / dt).mean(axis=0).ravel(),
-    ]).astype(np.float32))
+    ]).astype(np.float32), device=device)
     
     stepper_std_out = torch.as_tensor(np.hstack([
         ((X[1:] - X[:-1]) / dt).std(axis=0).ravel(),
         ((Z[1:] - Z[:-1]) / dt).std(axis=0).ravel(),
-    ]).astype(np.float32))
+    ]).astype(np.float32), device=device)
     
     stepper_mean_in = torch.as_tensor(np.hstack([
         X.mean(axis=0).ravel(),
         Z.mean(axis=0).ravel(),
-    ]).astype(np.float32))
+    ]).astype(np.float32), device=device)
     
     stepper_std_in = torch.as_tensor(np.hstack([
-        X_scale.repeat(nfeatures),
-        Z_scale.repeat(nlatent),
-    ]).astype(np.float32))
+        np.repeat(X_scale, nfeatures),
+        np.repeat(Z_scale, nlatent),
+    ]).astype(np.float32), device=device)
     
     # Make PyTorch tensors
     
@@ -95,7 +133,7 @@ if __name__ == '__main__':
     
     # Make networks
     
-    network_stepper = Stepper(nfeatures + nlatent)
+    network_stepper = Stepper(nfeatures + nlatent).to(device)
     
     # Function to generate test predictions
     
@@ -105,11 +143,12 @@ if __name__ == '__main__':
             
             # Get slice of database for first clip
             
-            start = range_starts[2]
-            stop = min(start + 1000, range_stops[2])
+            preview_index = min(2, len(range_starts) - 1)
+            start = range_starts[preview_index]
+            stop = min(start + 1000, range_stops[preview_index])
             
-            Xgnd = X[start:stop][np.newaxis]
-            Zgnd = Z[start:stop][np.newaxis]
+            Xgnd = X[start:stop][np.newaxis].to(device)
+            Zgnd = Z[start:stop][np.newaxis].to(device)
             
             # Predict, resetting every `window` frames
             
@@ -199,8 +238,8 @@ if __name__ == '__main__':
         
         batch = indices[torch.randint(0, len(indices), size=[batchsize])]
         
-        Xgnd = X[batch]
-        Zgnd = Z[batch]
+        Xgnd = X[batch].to(device)
+        Zgnd = Z[batch].to(device)
         
         # Predict
         
@@ -260,7 +299,7 @@ if __name__ == '__main__':
         if i % 10 == 0:
             sys.stdout.write('\rIter: %7i Loss: %5.3f' % (i, rolling_loss))
         
-        if i % 1000 == 0:
+        if i % args.save_every == 0:
             generate_predictions()
             save_network('stepper.bin', [
                 network_stepper.linear0, 
@@ -271,6 +310,6 @@ if __name__ == '__main__':
                 stepper_mean_out,
                 stepper_std_out)
             
-        if i % 1000 == 0:
+        if i % args.save_every == 0:
             scheduler.step()
             

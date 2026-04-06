@@ -78,6 +78,33 @@ void database_save_matching_features(const database& db, const char* filename)
     fclose(f);
 }
 
+bool environment_features_load(array2d<float>& environment_features, const char* filename)
+{
+    FILE* f = fopen(filename, "rb");
+    if (f == NULL)
+    {
+        return false;
+    }
+
+    int nframes = 0;
+    int nfeatures = 0;
+
+    fread(&nframes, sizeof(int), 1, f);
+    fread(&nfeatures, sizeof(int), 1, f);
+
+    if (nframes <= 0 || nfeatures <= 0)
+    {
+        fclose(f);
+        return false;
+    }
+
+    environment_features.resize(nframes, nfeatures);
+    fread(environment_features.data, sizeof(float), nframes * nfeatures, f);
+    fclose(f);
+
+    return true;
+}
+
 // When we add an offset to a frame in the database there is a chance
 // it will go out of the relevant range so here we can clamp it to 
 // the last frame of that range.
@@ -532,8 +559,15 @@ void database_build_matching_features(
     const float feature_weight_foot_velocity,
     const float feature_weight_hip_velocity,
     const float feature_weight_trajectory_positions,
-    const float feature_weight_trajectory_directions)
+    const float feature_weight_trajectory_directions,
+    const float feature_weight_environment = 1.0f,
+    const char* environment_features_filename = "resources/terrain_features.bin")
 {
+    array2d<float> environment_features;
+    bool environment_loaded = environment_features_load(environment_features, environment_features_filename);
+    int nenvironment_features = environment_loaded && environment_features.rows == db.nframes() ?
+        environment_features.cols : 0;
+
     int nfeatures = 
         3 + // Left Foot Position
         3 + // Right Foot Position 
@@ -541,7 +575,8 @@ void database_build_matching_features(
         3 + // Right Foot Velocity
         3 + // Hip Velocity
         6 + // Trajectory Positions 2D
-        6 ; // Trajectory Directions 2D
+        6 + // Trajectory Directions 2D
+        nenvironment_features;
         
     db.features.resize(db.nframes(), nfeatures);
     db.features_offset.resize(nfeatures);
@@ -555,6 +590,20 @@ void database_build_matching_features(
     compute_bone_velocity_feature(db, offset, Bone_Hips, feature_weight_hip_velocity);
     compute_trajectory_position_feature(db, offset, feature_weight_trajectory_positions);
     compute_trajectory_direction_feature(db, offset, feature_weight_trajectory_directions);
+
+    if (nenvironment_features > 0)
+    {
+        for (int i = 0; i < db.nframes(); i++)
+        {
+            for (int j = 0; j < nenvironment_features; j++)
+            {
+                db.features(i, offset + j) = environment_features(i, j);
+            }
+        }
+
+        normalize_feature(db.features, db.features_offset, db.features_scale, offset, nenvironment_features, feature_weight_environment);
+        offset += nenvironment_features;
+    }
     
     assert(offset == nfeatures);
     

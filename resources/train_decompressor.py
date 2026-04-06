@@ -1,5 +1,6 @@
 import sys
 import struct
+import argparse
 
 import numpy as np
 import tquat
@@ -12,9 +13,27 @@ import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.tensorboard import SummaryWriter
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except ModuleNotFoundError:
+    class SummaryWriter:  # type: ignore[override]
+        def add_scalar(self, *args, **kwargs):
+            pass
+
+        def add_scalars(self, *args, **kwargs):
+            pass
+
+        def flush(self):
+            pass
+
+        def close(self):
+            pass
 
 from train_common import load_database, load_features, save_network
+
+
+def safe_scalar_std(x, eps=1e-8):
+    return max(float(x), eps)
 
 # Networks
 
@@ -56,7 +75,18 @@ class Decompressor(nn.Module):
 
 # Training procedure
 
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--device', default=None)
+    parser.add_argument('--gpu', type=int, default=0)
+    parser.add_argument('--batchsize', type=int, default=32)
+    parser.add_argument('--niter', type=int, default=100000)
+    parser.add_argument('--save-every', type=int, default=1000)
+    parser.add_argument('--lr', type=float, default=0.001)
+    return parser.parse_args()
+
 if __name__ == '__main__':
+    args = parse_args()
     
     # Load data
     
@@ -82,15 +112,27 @@ if __name__ == '__main__':
     # Parameters
     
     seed = 1234
-    batchsize = 32
-    lr = 0.001
-    niter = 500000
+    batchsize = args.batchsize
+    lr = args.lr
+    niter = args.niter
     window = 2
     dt = 1.0 / 60.0
-    
+
+    if args.device is not None:
+        device = torch.device(args.device)
+    elif torch.cuda.is_available():
+        device = torch.device(f'cuda:{args.gpu}')
+    else:
+        device = torch.device('cpu')
+
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.set_num_threads(1)
+    if device.type == 'cuda':
+        torch.cuda.set_device(device)
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+    print(f'Using device: {device}')
     
     # Compute world space
     
@@ -124,19 +166,19 @@ if __name__ == '__main__':
     
     # Compute means/stds
     
-    Ypos_scale = Ypos[:,1:].std()
-    Ytxy_scale = Ytxy[:,1:].std()
-    Yvel_scale = Yvel[:,1:].std()
-    Yang_scale = Yang[:,1:].std()
+    Ypos_scale = safe_scalar_std(Ypos[:,1:].std())
+    Ytxy_scale = safe_scalar_std(Ytxy[:,1:].std())
+    Yvel_scale = safe_scalar_std(Yvel[:,1:].std())
+    Yang_scale = safe_scalar_std(Yang[:,1:].std())
     
-    Qpos_scale = Qpos[:,1:].std()
-    Qtxy_scale = Qtxy[:,1:].std()
-    Qvel_scale = Qvel[:,1:].std()
-    Qang_scale = Qang[:,1:].std()
+    Qpos_scale = safe_scalar_std(Qpos[:,1:].std())
+    Qtxy_scale = safe_scalar_std(Qtxy[:,1:].std())
+    Qvel_scale = safe_scalar_std(Qvel[:,1:].std())
+    Qang_scale = safe_scalar_std(Qang[:,1:].std())
     
-    Yrvel_scale = Yrvel.std()
-    Yrang_scale = Yrang.std()
-    Yextra_scale = Yextra.std()
+    Yrvel_scale = safe_scalar_std(Yrvel.std())
+    Yrang_scale = safe_scalar_std(Yrang.std())
+    Yextra_scale = safe_scalar_std(Yextra.std())
     
     decompressor_mean_out = torch.as_tensor(np.hstack([
         Ypos[:,1:].mean(axis=0).ravel(),
@@ -146,7 +188,7 @@ if __name__ == '__main__':
         Yrvel.mean(axis=0).ravel(),
         Yrang.mean(axis=0).ravel(),
         Yextra.mean(axis=0).ravel(),
-    ]).astype(np.float32))
+    ]).astype(np.float32), device=device)
     
     decompressor_std_out = torch.as_tensor(np.hstack([
         Ypos[:,1:].std(axis=0).ravel(),
@@ -156,10 +198,10 @@ if __name__ == '__main__':
         Yrvel.std(axis=0).ravel(),
         Yrang.std(axis=0).ravel(),
         Yextra.std(axis=0).ravel(),
-    ]).astype(np.float32))
+    ]).astype(np.float32), device=device)
     
-    decompressor_mean_in = torch.zeros([nfeatures + nlatent], dtype=torch.float32)
-    decompressor_std_in = torch.ones([nfeatures + nlatent], dtype=torch.float32)
+    decompressor_mean_in = torch.zeros([nfeatures + nlatent], dtype=torch.float32, device=device)
+    decompressor_std_in = torch.ones([nfeatures + nlatent], dtype=torch.float32, device=device)
     
     compressor_mean_in = torch.as_tensor(np.hstack([
         Ypos[:,1:].mean(axis=0).ravel(),
@@ -173,21 +215,21 @@ if __name__ == '__main__':
         Yrvel.mean(axis=0).ravel(),
         Yrang.mean(axis=0).ravel(),
         Yextra.mean(axis=0).ravel(),
-    ]).astype(np.float32))
+    ]).astype(np.float32), device=device)
     
     compressor_std_in = torch.as_tensor(np.hstack([
-        Ypos_scale.repeat((nbones-1)*3),
-        Ytxy_scale.repeat((nbones-1)*6),
-        Yvel_scale.repeat((nbones-1)*3),
-        Yang_scale.repeat((nbones-1)*3),
-        Qpos_scale.repeat((nbones-1)*3),
-        Qtxy_scale.repeat((nbones-1)*6),
-        Qvel_scale.repeat((nbones-1)*3),
-        Qang_scale.repeat((nbones-1)*3),
-        Yrvel_scale.repeat(3),
-        Yrang_scale.repeat(3),
-        Yextra_scale.repeat(nextra),
-    ]).astype(np.float32))
+        np.repeat(Ypos_scale, (nbones-1)*3),
+        np.repeat(Ytxy_scale, (nbones-1)*6),
+        np.repeat(Yvel_scale, (nbones-1)*3),
+        np.repeat(Yang_scale, (nbones-1)*3),
+        np.repeat(Qpos_scale, (nbones-1)*3),
+        np.repeat(Qtxy_scale, (nbones-1)*6),
+        np.repeat(Qvel_scale, (nbones-1)*3),
+        np.repeat(Qang_scale, (nbones-1)*3),
+        np.repeat(Yrvel_scale, 3),
+        np.repeat(Yrang_scale, 3),
+        np.repeat(Yextra_scale, nextra),
+    ]).astype(np.float32), device=device)
     
     # Make PyTorch tensors
     
@@ -212,8 +254,8 @@ if __name__ == '__main__':
     
     # Make networks
     
-    network_compressor = Compressor(len(compressor_mean_in), nlatent)
-    network_decompressor = Decompressor(nfeatures + nlatent, len(decompressor_mean_out))
+    network_compressor = Compressor(len(compressor_mean_in), nlatent).to(device)
+    network_decompressor = Decompressor(nfeatures + nlatent, len(decompressor_mean_out)).to(device)
     
     # Function to save compressed database
     
@@ -221,21 +263,27 @@ if __name__ == '__main__':
     
         with torch.no_grad():
             
-            # Pass database through compressor
-            
-            Z = network_compressor((torch.cat([
-                Ypos[:,1:].reshape([1, nframes, -1]),
-                Ytxy[:,1:].reshape([1, nframes, -1]),
-                Yvel[:,1:].reshape([1, nframes, -1]),
-                Yang[:,1:].reshape([1, nframes, -1]),
-                Qpos[:,1:].reshape([1, nframes, -1]),
-                Qtxy[:,1:].reshape([1, nframes, -1]),
-                Qvel[:,1:].reshape([1, nframes, -1]),
-                Qang[:,1:].reshape([1, nframes, -1]),
-                Yrvel.reshape([1, nframes, -1]),
-                Yrang.reshape([1, nframes, -1]),
-                Yextra.reshape([1, nframes, -1]),
-            ], dim=-1) - compressor_mean_in) / compressor_std_in)[0]
+            chunk_size = 4096
+            latent_chunks = []
+            for start in range(0, nframes, chunk_size):
+                stop = min(start + chunk_size, nframes)
+                chunk = torch.cat([
+                    Ypos[start:stop,1:].reshape([1, stop-start, -1]).to(device),
+                    Ytxy[start:stop,1:].reshape([1, stop-start, -1]).to(device),
+                    Yvel[start:stop,1:].reshape([1, stop-start, -1]).to(device),
+                    Yang[start:stop,1:].reshape([1, stop-start, -1]).to(device),
+                    Qpos[start:stop,1:].reshape([1, stop-start, -1]).to(device),
+                    Qtxy[start:stop,1:].reshape([1, stop-start, -1]).to(device),
+                    Qvel[start:stop,1:].reshape([1, stop-start, -1]).to(device),
+                    Qang[start:stop,1:].reshape([1, stop-start, -1]).to(device),
+                    Yrvel[start:stop].reshape([1, stop-start, -1]).to(device),
+                    Yrang[start:stop].reshape([1, stop-start, -1]).to(device),
+                    Yextra[start:stop].reshape([1, stop-start, -1]).to(device),
+                ], dim=-1)
+                latent_chunks.append(
+                    network_compressor((chunk - compressor_mean_in) / compressor_std_in)[0].cpu()
+                )
+            Z = torch.cat(latent_chunks, dim=0)
             
             # Write latent variables
             
@@ -250,25 +298,26 @@ if __name__ == '__main__':
             
             # Get slice of database for first clip
             
-            start = range_starts[2]
-            stop = min(start + 1000, range_stops[2])
+            preview_index = min(2, len(range_starts) - 1)
+            start = range_starts[preview_index]
+            stop = min(start + 1000, range_stops[preview_index])
             
-            Ygnd_pos = Ypos[start:stop][np.newaxis]
-            Ygnd_rot = Yrot[start:stop][np.newaxis]
-            Ygnd_txy = Ytxy[start:stop][np.newaxis]
-            Ygnd_vel = Yvel[start:stop][np.newaxis]
-            Ygnd_ang = Yang[start:stop][np.newaxis]
+            Ygnd_pos = Ypos[start:stop][np.newaxis].to(device)
+            Ygnd_rot = Yrot[start:stop][np.newaxis].to(device)
+            Ygnd_txy = Ytxy[start:stop][np.newaxis].to(device)
+            Ygnd_vel = Yvel[start:stop][np.newaxis].to(device)
+            Ygnd_ang = Yang[start:stop][np.newaxis].to(device)
             
-            Qgnd_pos = Qpos[start:stop][np.newaxis]
-            Qgnd_txy = Qtxy[start:stop][np.newaxis]
-            Qgnd_vel = Qvel[start:stop][np.newaxis]
-            Qgnd_ang = Qang[start:stop][np.newaxis]
+            Qgnd_pos = Qpos[start:stop][np.newaxis].to(device)
+            Qgnd_txy = Qtxy[start:stop][np.newaxis].to(device)
+            Qgnd_vel = Qvel[start:stop][np.newaxis].to(device)
+            Qgnd_ang = Qang[start:stop][np.newaxis].to(device)
             
-            Ygnd_rvel = Yrvel[start:stop][np.newaxis]
-            Ygnd_rang = Yrang[start:stop][np.newaxis]
-            Ygnd_extra = Yextra[start:stop][np.newaxis]
+            Ygnd_rvel = Yrvel[start:stop][np.newaxis].to(device)
+            Ygnd_rang = Yrang[start:stop][np.newaxis].to(device)
+            Ygnd_extra = Yextra[start:stop][np.newaxis].to(device)
             
-            Xgnd = X[start:stop][np.newaxis]
+            Xgnd = X[start:stop][np.newaxis].to(device)
             
             # Pass through compressor
             
@@ -408,23 +457,23 @@ if __name__ == '__main__':
         
         batch = indices[torch.randint(0, len(indices), size=[batchsize])]
         
-        Xgnd = X[batch]
+        Xgnd = X[batch].to(device)
         
-        Ygnd_pos = Ypos[batch]
-        Ygnd_txy = Ytxy[batch]
-        Ygnd_vel = Yvel[batch]
-        Ygnd_ang = Yang[batch]
+        Ygnd_pos = Ypos[batch].to(device)
+        Ygnd_txy = Ytxy[batch].to(device)
+        Ygnd_vel = Yvel[batch].to(device)
+        Ygnd_ang = Yang[batch].to(device)
         
-        Qgnd_pos = Qpos[batch]
-        Qgnd_xfm = Qxfm[batch]
-        Qgnd_txy = Qtxy[batch]
-        Qgnd_vel = Qvel[batch]
-        Qgnd_ang = Qang[batch]
+        Qgnd_pos = Qpos[batch].to(device)
+        Qgnd_xfm = Qxfm[batch].to(device)
+        Qgnd_txy = Qtxy[batch].to(device)
+        Qgnd_vel = Qvel[batch].to(device)
+        Qgnd_ang = Qang[batch].to(device)
         
-        Ygnd_rvel = Yrvel[batch]
-        Ygnd_rang = Yrang[batch]
+        Ygnd_rvel = Yrvel[batch].to(device)
+        Ygnd_rang = Yrang[batch].to(device)
         
-        Ygnd_extra = Yextra[batch]
+        Ygnd_extra = Yextra[batch].to(device)
         
         # Encode
         
@@ -578,7 +627,7 @@ if __name__ == '__main__':
         if i % 10 == 0:
             sys.stdout.write('\rIter: %7i Loss: %5.3f' % (i, rolling_loss))
         
-        if i % 1000 == 0:
+        if i % args.save_every == 0:
             generate_animation()
             save_compressed_database()
             save_network('decompressor.bin', [
@@ -589,6 +638,6 @@ if __name__ == '__main__':
                 decompressor_mean_out,
                 decompressor_std_out)
             
-        if i % 1000 == 0:
+        if i % args.save_every == 0:
             scheduler.step()
             

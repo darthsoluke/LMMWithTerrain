@@ -18,12 +18,367 @@
 
 #include <initializer_list>
 #include <functional>
+#include <vector>
 
 //--------------------------------------
 
 static inline Vector3 to_Vector3(vec3 v)
 {
     return (Vector3){ v.x, v.y, v.z };
+}
+
+struct environment_box
+{
+    vec3 position;
+    vec3 scale;
+    bool traversable;
+    Color fill;
+    Color wire;
+};
+
+struct environment_heightmap
+{
+    float x_min = 0.0f;
+    float x_max = 0.0f;
+    float z_min = 0.0f;
+    float z_max = 0.0f;
+    int width = 0;
+    int height = 0;
+    std::vector<float> data;
+
+    bool loaded() const { return width > 1 && height > 1 && !data.empty(); }
+
+    float sample(float x, float z) const
+    {
+        if (!loaded())
+        {
+            return 0.0f;
+        }
+
+        float px = (x - x_min) / maxf(x_max - x_min, 1e-5f) * (width - 1);
+        float pz = (z - z_min) / maxf(z_max - z_min, 1e-5f) * (height - 1);
+
+        int x0 = clamp((int)floorf(px), 0, width - 1);
+        int x1 = clamp((int)ceilf(px), 0, width - 1);
+        int z0 = clamp((int)floorf(pz), 0, height - 1);
+        int z1 = clamp((int)ceilf(pz), 0, height - 1);
+
+        float ax = px - floorf(px);
+        float az = pz - floorf(pz);
+
+        auto at = [&](int ix, int iz)
+        {
+            return data[ix + iz * width];
+        };
+
+        float s0 = at(x0, z0);
+        float s1 = at(x1, z0);
+        float s2 = at(x0, z1);
+        float s3 = at(x1, z1);
+
+        return lerpf(lerpf(s0, s1, ax), lerpf(s2, s3, ax), az);
+    }
+
+    bool load(const char* filename)
+    {
+        FILE* f = fopen(filename, "rb");
+        if (f == NULL)
+        {
+            width = 0;
+            height = 0;
+            data.clear();
+            return false;
+        }
+
+        fread(&width, sizeof(int), 1, f);
+        fread(&height, sizeof(int), 1, f);
+        fread(&x_min, sizeof(float), 1, f);
+        fread(&x_max, sizeof(float), 1, f);
+        fread(&z_min, sizeof(float), 1, f);
+        fread(&z_max, sizeof(float), 1, f);
+
+        if (width <= 1 || height <= 1)
+        {
+            fclose(f);
+            width = 0;
+            height = 0;
+            data.clear();
+            return false;
+        }
+
+        data.resize(width * height);
+        fread(data.data(), sizeof(float), width * height, f);
+        fclose(f);
+
+        return true;
+    }
+};
+
+static environment_heightmap g_environment_heightmap;
+static const char* PFNN_HEIGHTMAP_LABEL = "PFNN Rocky";
+static const char* PFNN_TERRAIN_GRID_FILENAME = "./resources/pfnn_terrain_rocky_grid.bin";
+static const char* PFNN_ENVIRONMENT_FEATURES_FILENAME = "resources/terrain_features.bin";
+static const char* PFNN_ENVIRONMENT_BOXES_FILENAME = "./resources/environment_boxes.txt";
+static const int MOTION_MATCH_BASE_FEATURE_COUNT = 27;
+static const int PFNN_TERRAIN_FEATURE_COUNT = 9;
+static const int PFNN_OBSTACLE_SDF_FEATURE_COUNT = 9;
+static const float PFNN_TERRAIN_STRIP_HALF_WIDTH = 0.25f;
+static const float PFNN_OBSTACLE_SDF_CLAMP_DISTANCE = 2.5f;
+#if defined(PLATFORM_WEB)
+static const char* CHECKERBOARD_VERTEX_SHADER_FILENAME = "./resources/checkerboard.vs";
+static const char* CHECKERBOARD_FRAGMENT_SHADER_FILENAME = "./resources/checkerboard.fs";
+static const char* CHARACTER_VERTEX_SHADER_FILENAME = "./resources/character.vs";
+static const char* CHARACTER_FRAGMENT_SHADER_FILENAME = "./resources/character.fs";
+#else
+static const char* CHECKERBOARD_VERTEX_SHADER_FILENAME = "./resources/checkerboard_330.vs";
+static const char* CHECKERBOARD_FRAGMENT_SHADER_FILENAME = "./resources/checkerboard_330.fs";
+static const char* CHARACTER_VERTEX_SHADER_FILENAME = "./resources/character_330.vs";
+static const char* CHARACTER_FRAGMENT_SHADER_FILENAME = "./resources/character_330.fs";
+#endif
+static bool load_environment_heightmap()
+{
+    return g_environment_heightmap.load(PFNN_TERRAIN_GRID_FILENAME);
+}
+
+float environment_base_height(float x, float z)
+{
+    return g_environment_heightmap.sample(x, z);
+}
+
+static environment_box make_environment_box(vec3 position, vec3 scale, bool traversable)
+{
+    environment_box box;
+    box.position = position;
+    box.scale = scale;
+    box.traversable = traversable;
+    box.fill = traversable ? Color{ 90, 136, 173, 110 } : Color{ 147, 96, 74, 120 };
+    box.wire = traversable ? Color{ 53, 87, 114, 255 } : Color{ 96, 54, 41, 255 };
+    return box;
+}
+
+static void load_default_environment_boxes(array1d<environment_box>& environment_boxes)
+{
+    environment_boxes.resize(3);
+    environment_boxes(0) = make_environment_box(vec3(1.75f, 0.0f, 1.25f), vec3(1.2f, 1.0f, 2.2f), false);
+    environment_boxes(1) = make_environment_box(vec3(-1.35f, 0.0f, -1.10f), vec3(1.8f, 1.0f, 1.6f), false);
+    environment_boxes(2) = make_environment_box(vec3(0.15f, 0.0f, 2.05f), vec3(1.1f, 1.0f, 1.0f), false);
+}
+
+static bool load_environment_boxes(array1d<environment_box>& environment_boxes, const char* filename)
+{
+    FILE* f = fopen(filename, "r");
+    if (f == NULL)
+    {
+        return false;
+    }
+
+    std::vector<environment_box> boxes;
+    char line[256];
+
+    while (fgets(line, sizeof(line), f) != NULL)
+    {
+        if (line[0] == '#' || line[0] == '\n' || line[0] == '\r')
+        {
+            continue;
+        }
+
+        float px, py, pz;
+        float sx, sy, sz;
+        int traversable = 0;
+        int parsed = sscanf(line, " %f %f %f %f %f %f %d", &px, &py, &pz, &sx, &sy, &sz, &traversable);
+
+        if (parsed == 7)
+        {
+            boxes.push_back(make_environment_box(
+                vec3(px, py, pz),
+                vec3(sx, sy, sz),
+                traversable != 0));
+        }
+    }
+
+    fclose(f);
+
+    environment_boxes.resize((int)boxes.size());
+    for (int i = 0; i < environment_boxes.size; i++)
+    {
+        environment_boxes(i) = boxes[i];
+    }
+
+    return true;
+}
+
+static void initialize_environment_boxes(array1d<environment_box>& environment_boxes)
+{
+    if (!load_environment_boxes(environment_boxes, PFNN_ENVIRONMENT_BOXES_FILENAME))
+    {
+        load_default_environment_boxes(environment_boxes);
+    }
+}
+
+static inline bool environment_box_contains_xz(
+    const environment_box& box,
+    const float x,
+    const float z,
+    const float padding = 0.0f)
+{
+    return
+        x >= box.position.x - 0.5f * box.scale.x - padding &&
+        x <= box.position.x + 0.5f * box.scale.x + padding &&
+        z >= box.position.z - 0.5f * box.scale.z - padding &&
+        z <= box.position.z + 0.5f * box.scale.z + padding;
+}
+
+static inline float environment_box_base(const environment_box& box)
+{
+    return environment_base_height(box.position.x, box.position.z) + box.position.y;
+}
+
+static inline float environment_box_top(const environment_box& box)
+{
+    return environment_box_base(box) + box.scale.y;
+}
+
+static inline float environment_box_signed_distance_xz(
+    const environment_box& box,
+    const float x,
+    const float z)
+{
+    float dx = fabsf(x - box.position.x) - 0.5f * box.scale.x;
+    float dz = fabsf(z - box.position.z) - 0.5f * box.scale.z;
+
+    float outside_dx = maxf(dx, 0.0f);
+    float outside_dz = maxf(dz, 0.0f);
+    float outside_distance = sqrtf(outside_dx * outside_dx + outside_dz * outside_dz);
+    float inside_distance = minf(maxf(dx, dz), 0.0f);
+
+    return outside_distance + inside_distance;
+}
+
+float environment_obstacle_sdf(
+    const float x,
+    const float z,
+    const slice1d<environment_box> environment_boxes,
+    const float clamp_distance = PFNN_OBSTACLE_SDF_CLAMP_DISTANCE)
+{
+    float sdf = clamp_distance;
+    bool found_obstacle = false;
+
+    for (int i = 0; i < environment_boxes.size; i++)
+    {
+        const environment_box& box = environment_boxes(i);
+
+        if (box.traversable)
+        {
+            continue;
+        }
+
+        sdf = minf(sdf, environment_box_signed_distance_xz(box, x, z));
+        found_obstacle = true;
+    }
+
+    return found_obstacle ? clampf(sdf, -clamp_distance, clamp_distance) : clamp_distance;
+}
+
+float environment_surface_height(
+    const float x,
+    const float z,
+    const slice1d<environment_box> environment_boxes)
+{
+    float height = environment_base_height(x, z);
+
+    for (int i = 0; i < environment_boxes.size; i++)
+    {
+        const environment_box& box = environment_boxes(i);
+
+        if (!box.traversable)
+        {
+            continue;
+        }
+
+        if (environment_box_contains_xz(box, x, z))
+        {
+            height = maxf(height, environment_box_top(box));
+        }
+    }
+
+    return height;
+}
+
+void terrain_mesh_apply_heightfield(Mesh& mesh, bool upload_to_gpu = false)
+{
+    for (int i = 0; i < mesh.vertexCount; i++)
+    {
+        float x = mesh.vertices[3 * i + 0];
+        float z = mesh.vertices[3 * i + 2];
+
+        mesh.vertices[3 * i + 1] = environment_base_height(x, z);
+        mesh.normals[3 * i + 0] = 0.0f;
+        mesh.normals[3 * i + 1] = 0.0f;
+        mesh.normals[3 * i + 2] = 0.0f;
+    }
+
+    for (int i = 0; i < mesh.triangleCount; i++)
+    {
+        unsigned short i0 = mesh.indices[3 * i + 0];
+        unsigned short i1 = mesh.indices[3 * i + 1];
+        unsigned short i2 = mesh.indices[3 * i + 2];
+
+        vec3 v0(
+            mesh.vertices[3 * i0 + 0],
+            mesh.vertices[3 * i0 + 1],
+            mesh.vertices[3 * i0 + 2]);
+        vec3 v1(
+            mesh.vertices[3 * i1 + 0],
+            mesh.vertices[3 * i1 + 1],
+            mesh.vertices[3 * i1 + 2]);
+        vec3 v2(
+            mesh.vertices[3 * i2 + 0],
+            mesh.vertices[3 * i2 + 1],
+            mesh.vertices[3 * i2 + 2]);
+
+        vec3 normal = normalize(cross(v1 - v0, v2 - v0));
+
+        mesh.normals[3 * i0 + 0] += normal.x;
+        mesh.normals[3 * i0 + 1] += normal.y;
+        mesh.normals[3 * i0 + 2] += normal.z;
+
+        mesh.normals[3 * i1 + 0] += normal.x;
+        mesh.normals[3 * i1 + 1] += normal.y;
+        mesh.normals[3 * i1 + 2] += normal.z;
+
+        mesh.normals[3 * i2 + 0] += normal.x;
+        mesh.normals[3 * i2 + 1] += normal.y;
+        mesh.normals[3 * i2 + 2] += normal.z;
+    }
+
+    for (int i = 0; i < mesh.vertexCount; i++)
+    {
+        vec3 normal(
+            mesh.normals[3 * i + 0],
+            mesh.normals[3 * i + 1],
+            mesh.normals[3 * i + 2]);
+
+        normal = normalize(normal);
+
+        mesh.normals[3 * i + 0] = normal.x;
+        mesh.normals[3 * i + 1] = normal.y;
+        mesh.normals[3 * i + 2] = normal.z;
+    }
+
+    if (upload_to_gpu)
+    {
+        UpdateMeshBuffer(mesh, 0, mesh.vertices, mesh.vertexCount * 3 * sizeof(float), 0);
+        UpdateMeshBuffer(mesh, 2, mesh.normals, mesh.vertexCount * 3 * sizeof(float), 0);
+    }
+}
+
+void terrain_mesh_offset_xz(Mesh& mesh, const float offset_x, const float offset_z)
+{
+    for (int i = 0; i < mesh.vertexCount; i++)
+    {
+        mesh.vertices[3 * i + 0] += offset_x;
+        mesh.vertices[3 * i + 2] += offset_z;
+    }
 }
 
 //--------------------------------------
@@ -103,6 +458,30 @@ vec3 gamepad_get_stick(int stick, const float deadzone = 0.2f)
 {
     float gamepadx = GetGamepadAxisMovement(GAMEPAD_PLAYER, stick == GAMEPAD_STICK_LEFT ? GAMEPAD_AXIS_LEFT_X : GAMEPAD_AXIS_RIGHT_X);
     float gamepady = GetGamepadAxisMovement(GAMEPAD_PLAYER, stick == GAMEPAD_STICK_LEFT ? GAMEPAD_AXIS_LEFT_Y : GAMEPAD_AXIS_RIGHT_Y);
+
+    if (stick == GAMEPAD_STICK_LEFT)
+    {
+        if (IsKeyDown(KEY_A)) gamepadx -= 1.0f;
+        if (IsKeyDown(KEY_D)) gamepadx += 1.0f;
+        if (IsKeyDown(KEY_W)) gamepady -= 1.0f;
+        if (IsKeyDown(KEY_S)) gamepady += 1.0f;
+    }
+    else if (stick == GAMEPAD_STICK_RIGHT)
+    {
+        if (IsKeyDown(KEY_LEFT))  gamepadx -= 1.0f;
+        if (IsKeyDown(KEY_RIGHT)) gamepadx += 1.0f;
+        if (IsKeyDown(KEY_UP))    gamepady -= 1.0f;
+        if (IsKeyDown(KEY_DOWN))  gamepady += 1.0f;
+
+        if (IsMouseButtonDown(MOUSE_BUTTON_RIGHT))
+        {
+            Vector2 mouse_delta = GetMouseDelta();
+            const float mouse_sensitivity = 0.045f;
+            gamepadx += mouse_sensitivity * mouse_delta.x;
+            gamepady += mouse_sensitivity * mouse_delta.y;
+        }
+    }
+
     float gamepadmag = sqrtf(gamepadx*gamepadx + gamepady*gamepady);
     
     if (gamepadmag > deadzone)
@@ -568,6 +947,52 @@ void query_compute_trajectory_direction_feature(
     offset += 6;
 }
 
+void query_compute_environment_feature(
+    slice1d<float> query,
+    int& offset,
+    const vec3 root_position,
+    const slice1d<vec3> trajectory_positions,
+    const slice1d<quat> trajectory_rotations,
+    const slice1d<environment_box> environment_boxes,
+    const int environment_feature_count)
+{
+    const float root_ground_height = environment_base_height(root_position.x, root_position.z);
+    int terrain_offset = offset;
+
+    for (int i = 1; i < trajectory_positions.size; i++)
+    {
+        vec3 center = trajectory_positions(i);
+        vec3 right = quat_mul_vec3(trajectory_rotations(i), vec3(1.0f, 0.0f, 0.0f));
+
+        vec3 sample_right = center + PFNN_TERRAIN_STRIP_HALF_WIDTH * right;
+        vec3 sample_left = center - PFNN_TERRAIN_STRIP_HALF_WIDTH * right;
+
+        if (environment_feature_count >= PFNN_TERRAIN_FEATURE_COUNT)
+        {
+            query(terrain_offset + 0) = environment_base_height(sample_right.x, sample_right.z) - root_ground_height;
+            query(terrain_offset + 1) = environment_base_height(center.x, center.z) - root_ground_height;
+            query(terrain_offset + 2) = environment_base_height(sample_left.x, sample_left.z) - root_ground_height;
+        }
+
+        if (environment_feature_count >= PFNN_TERRAIN_FEATURE_COUNT + PFNN_OBSTACLE_SDF_FEATURE_COUNT)
+        {
+            int sdf_offset = offset + PFNN_TERRAIN_FEATURE_COUNT + (i - 1) * 3;
+            query(sdf_offset + 0) = environment_obstacle_sdf(sample_right.x, sample_right.z, environment_boxes);
+            query(sdf_offset + 1) = environment_obstacle_sdf(center.x, center.z, environment_boxes);
+            query(sdf_offset + 2) = environment_obstacle_sdf(sample_left.x, sample_left.z, environment_boxes);
+        }
+
+        terrain_offset += 3;
+    }
+
+    for (int i = PFNN_TERRAIN_FEATURE_COUNT + PFNN_OBSTACLE_SDF_FEATURE_COUNT; i < environment_feature_count; i++)
+    {
+        query(offset + i) = 0.0f;
+    }
+
+    offset += environment_feature_count;
+}
+
 //--------------------------------------
 
 // Collide against the obscales which are
@@ -575,12 +1000,12 @@ void query_compute_trajectory_direction_feature(
 vec3 simulation_collide_obstacles(
     const vec3 prev_pos,
     const vec3 next_pos,
-    const slice1d<vec3> obstacles_positions,
-    const slice1d<vec3> obstacles_scales,
+    const slice1d<environment_box> environment_boxes,
     const float radius = 0.6f)
 {
     vec3 dx = next_pos - prev_pos;
     vec3 proj_pos = prev_pos;
+    proj_pos.y = environment_surface_height(proj_pos.x, proj_pos.z, environment_boxes);
     
     // Substep because I'm too lazy to implement CCD
     int substeps = 1 + (int)(length(dx) * 5.0f);
@@ -588,21 +1013,65 @@ vec3 simulation_collide_obstacles(
     for (int j = 0; j < substeps; j++)
     {
         proj_pos = proj_pos + dx / substeps;
+        proj_pos.y = environment_surface_height(proj_pos.x, proj_pos.z, environment_boxes);
         
-        for (int i = 0; i < obstacles_positions.size; i++)
+        for (int i = 0; i < environment_boxes.size; i++)
         {
-            // Find nearest point inside obscale and push out
-            vec3 nearest = clamp(proj_pos, 
-              obstacles_positions(i) - 0.5f * obstacles_scales(i),
-              obstacles_positions(i) + 0.5f * obstacles_scales(i));
+            const environment_box& box = environment_boxes(i);
 
-            if (length(nearest - proj_pos) < radius)
+            if (box.traversable)
             {
-                proj_pos = radius * normalize(proj_pos - nearest) + nearest;
+                continue;
+            }
+
+            if (proj_pos.y > environment_box_top(box) + 0.4f)
+            {
+                continue;
+            }
+
+            float nearest_x = clampf(
+                proj_pos.x,
+                box.position.x - 0.5f * box.scale.x,
+                box.position.x + 0.5f * box.scale.x);
+            float nearest_z = clampf(
+                proj_pos.z,
+                box.position.z - 0.5f * box.scale.z,
+                box.position.z + 0.5f * box.scale.z);
+
+            vec3 delta = vec3(proj_pos.x - nearest_x, 0.0f, proj_pos.z - nearest_z);
+            float delta_length = length(delta);
+
+            if (delta_length < radius)
+            {
+                if (delta_length < 1e-5f)
+                {
+                    float dist_left = fabsf(proj_pos.x - (box.position.x - 0.5f * box.scale.x));
+                    float dist_right = fabsf((box.position.x + 0.5f * box.scale.x) - proj_pos.x);
+                    float dist_back = fabsf(proj_pos.z - (box.position.z - 0.5f * box.scale.z));
+                    float dist_front = fabsf((box.position.z + 0.5f * box.scale.z) - proj_pos.z);
+
+                    if (minf(dist_left, dist_right) < minf(dist_back, dist_front))
+                    {
+                        delta = vec3(dist_left < dist_right ? -1.0f : 1.0f, 0.0f, 0.0f);
+                    }
+                    else
+                    {
+                        delta = vec3(0.0f, 0.0f, dist_back < dist_front ? -1.0f : 1.0f);
+                    }
+
+                    delta_length = 1.0f;
+                }
+
+                delta = delta / delta_length;
+                proj_pos = vec3(
+                    nearest_x + radius * delta.x,
+                    proj_pos.y,
+                    nearest_z + radius * delta.z);
             }
         }
     } 
     
+    proj_pos.y = environment_surface_height(proj_pos.x, proj_pos.z, environment_boxes);
     return proj_pos;
 }
 
@@ -614,8 +1083,7 @@ void simulation_positions_update(
     const vec3 desired_velocity, 
     const float halflife, 
     const float dt,
-    const slice1d<vec3> obstacles_positions,
-    const slice1d<vec3> obstacles_scales)
+    const slice1d<environment_box> environment_boxes)
 {
     float y = halflife_to_damping(halflife) / 2.0f; 
     vec3 j0 = velocity - desired_velocity;
@@ -632,8 +1100,7 @@ void simulation_positions_update(
     position = simulation_collide_obstacles(
         position_prev, 
         position,
-        obstacles_positions,
-        obstacles_scales);
+        environment_boxes);
 }
 
 void simulation_rotations_update(
@@ -693,8 +1160,7 @@ void trajectory_positions_predict(
     const slice1d<vec3> desired_velocities, 
     const float halflife,
     const float dt,
-    const slice1d<vec3> obstacles_positions,
-    const slice1d<vec3> obstacles_scales)
+    const slice1d<environment_box> environment_boxes)
 {
     positions(0) = position;
     velocities(0) = velocity;
@@ -713,8 +1179,7 @@ void trajectory_positions_predict(
             desired_velocities(i), 
             halflife, 
             dt, 
-            obstacles_positions, 
-            obstacles_scales);
+            environment_boxes);
     }
 }
 
@@ -805,6 +1270,7 @@ void contact_update(
     const vec3 input_contact_position,
     const bool input_contact_state,
     const float unlock_radius,
+    const float ground_height,
     const float foot_height,
     const float halflife,
     const float dt,
@@ -841,7 +1307,7 @@ void contact_update(
         // the foot projected onto the ground plus foot height
         contact_lock = true;
         contact_point = contact_position;
-        contact_point.y = foot_height;
+        contact_point.y = ground_height + foot_height;
         
         inertialize_transition(
             contact_offset_position,
@@ -968,6 +1434,30 @@ void draw_axis(const vec3 pos, const quat rot, const float scale = 1.0f)
     DrawLine3D(to_Vector3(pos), to_Vector3(axis2), BLUE);
 }
 
+void draw_skeleton(
+    const slice1d<vec3> global_bone_positions,
+    const slice1d<int> bone_parents,
+    const Color joint_color = DARKGRAY,
+    const Color line_color = BLACK,
+    const vec3 offset = vec3())
+{
+    for (int i = 0; i < global_bone_positions.size; i++)
+    {
+        vec3 joint_position = global_bone_positions(i) + offset;
+        DrawSphereWires(to_Vector3(joint_position), i == 0 ? 0.05f : 0.035f, 4, 8, joint_color);
+
+        if (bone_parents(i) != -1)
+        {
+            DrawLine3D(
+                to_Vector3(global_bone_positions(bone_parents(i)) + offset),
+                to_Vector3(joint_position),
+                line_color);
+        }
+    }
+
+    draw_axis(global_bone_positions(0) + offset, quat(), 0.2f);
+}
+
 void draw_features(const slice1d<float> features, const vec3 pos, const quat rot, const Color color)
 {
     vec3 lfoot_pos = quat_mul_vec3(rot, vec3(features( 0), features( 1), features( 2))) + pos;
@@ -994,6 +1484,72 @@ void draw_features(const slice1d<float> features, const vec3 pos, const quat rot
     DrawLine3D(to_Vector3(traj0_pos), to_Vector3(traj0_pos + 0.25f * traj0_dir), color);
     DrawLine3D(to_Vector3(traj1_pos), to_Vector3(traj1_pos + 0.25f * traj1_dir), color);
     DrawLine3D(to_Vector3(traj2_pos), to_Vector3(traj2_pos + 0.25f * traj2_dir), color); 
+
+    if (features.size >= MOTION_MATCH_BASE_FEATURE_COUNT + PFNN_TERRAIN_FEATURE_COUNT)
+    {
+        float root_ground_height = environment_base_height(pos.x, pos.z);
+        vec3 up = vec3(0.0f, 1.0f, 0.0f);
+
+        auto draw_terrain_strip = [&](vec3 traj_pos, vec3 traj_dir, int terrain_offset)
+        {
+            vec3 dir = normalize(vec3(traj_dir.x, 0.0f, traj_dir.z) + vec3(1e-5f, 0.0f, 0.0f));
+            vec3 right = normalize(cross(up, dir));
+
+            vec3 sample_right = traj_pos + PFNN_TERRAIN_STRIP_HALF_WIDTH * right;
+            vec3 sample_center = traj_pos;
+            vec3 sample_left = traj_pos - PFNN_TERRAIN_STRIP_HALF_WIDTH * right;
+
+            sample_right.y = root_ground_height + features(terrain_offset + 0);
+            sample_center.y = root_ground_height + features(terrain_offset + 1);
+            sample_left.y = root_ground_height + features(terrain_offset + 2);
+
+            DrawSphere(to_Vector3(sample_right), 0.035f, DARKGREEN);
+            DrawSphere(to_Vector3(sample_center), 0.035f, GREEN);
+            DrawSphere(to_Vector3(sample_left), 0.035f, DARKGREEN);
+            DrawLine3D(to_Vector3(sample_left), to_Vector3(sample_center), DARKGREEN);
+            DrawLine3D(to_Vector3(sample_center), to_Vector3(sample_right), DARKGREEN);
+        };
+
+        draw_terrain_strip(traj0_pos, traj0_dir, MOTION_MATCH_BASE_FEATURE_COUNT + 0);
+        draw_terrain_strip(traj1_pos, traj1_dir, MOTION_MATCH_BASE_FEATURE_COUNT + 3);
+        draw_terrain_strip(traj2_pos, traj2_dir, MOTION_MATCH_BASE_FEATURE_COUNT + 6);
+    }
+
+    if (features.size >= MOTION_MATCH_BASE_FEATURE_COUNT + PFNN_TERRAIN_FEATURE_COUNT + PFNN_OBSTACLE_SDF_FEATURE_COUNT)
+    {
+        vec3 up = vec3(0.0f, 1.0f, 0.0f);
+
+        auto draw_sdf_strip = [&](vec3 traj_pos, vec3 traj_dir, int sdf_offset)
+        {
+            vec3 dir = normalize(vec3(traj_dir.x, 0.0f, traj_dir.z) + vec3(1e-5f, 0.0f, 0.0f));
+            vec3 right = normalize(cross(up, dir));
+
+            vec3 samples[3] = {
+                traj_pos + PFNN_TERRAIN_STRIP_HALF_WIDTH * right,
+                traj_pos,
+                traj_pos - PFNN_TERRAIN_STRIP_HALF_WIDTH * right,
+            };
+
+            for (int i = 0; i < 3; i++)
+            {
+                float sdf = features(sdf_offset + i);
+                float danger = sdf < 0.0f ? 1.0f : 1.0f - clampf(sdf / PFNN_OBSTACLE_SDF_CLAMP_DISTANCE, 0.0f, 1.0f);
+                float radius = 0.05f + 0.12f * danger;
+
+                samples[i].y = environment_base_height(samples[i].x, samples[i].z) + 0.03f;
+
+                Color sdf_color = sdf < 0.0f ? MAROON :
+                    (sdf < 0.25f ? RED :
+                    (sdf < 0.75f ? ORANGE : GRAY));
+
+                DrawSphereWires(to_Vector3(samples[i]), radius, 5, 8, sdf_color);
+            }
+        };
+
+        draw_sdf_strip(traj0_pos, traj0_dir, MOTION_MATCH_BASE_FEATURE_COUNT + PFNN_TERRAIN_FEATURE_COUNT + 0);
+        draw_sdf_strip(traj1_pos, traj1_dir, MOTION_MATCH_BASE_FEATURE_COUNT + PFNN_TERRAIN_FEATURE_COUNT + 3);
+        draw_sdf_strip(traj2_pos, traj2_dir, MOTION_MATCH_BASE_FEATURE_COUNT + PFNN_TERRAIN_FEATURE_COUNT + 6);
+    }
 }
 
 void draw_trajectory(
@@ -1010,30 +1566,31 @@ void draw_trajectory(
     }
 }
 
-void draw_obstacles(
-    const slice1d<vec3> obstacles_positions,
-    const slice1d<vec3> obstacles_scales)
+void draw_environment_boxes(
+    const slice1d<environment_box> environment_boxes)
 {
-    for (int i = 0; i < obstacles_positions.size; i++)
+    for (int i = 0; i < environment_boxes.size; i++)
     {
+        const environment_box& box = environment_boxes(i);
+
         vec3 position = vec3(
-            obstacles_positions(i).x, 
-            obstacles_positions(i).y + 0.5f * obstacles_scales(i).y + 0.01f, 
-            obstacles_positions(i).z);
+            box.position.x,
+            environment_box_base(box) + 0.5f * box.scale.y + 0.01f,
+            box.position.z);
       
         DrawCube(
             to_Vector3(position),
-            obstacles_scales(i).x, 
-            obstacles_scales(i).y, 
-            obstacles_scales(i).z,
-            LIGHTGRAY);
+            box.scale.x,
+            box.scale.y,
+            box.scale.z,
+            box.fill);
             
         DrawCubeWires(
             to_Vector3(position),
-            obstacles_scales(i).x, 
-            obstacles_scales(i).y, 
-            obstacles_scales(i).z,
-            GRAY);
+            box.scale.x,
+            box.scale.y,
+            box.scale.z,
+            box.wire);
     }
 }
 
@@ -1222,33 +1779,52 @@ int main(void)
     float camera_azimuth = 0.0f;
     float camera_altitude = 0.4f;
     float camera_distance = 4.0f;
+    bool terrain_preview_enabled = false;
+    bool debug_draw_mesh = true;
+    bool debug_draw_skeleton = true;
+    bool debug_draw_bind_skeleton = false;
+    bool debug_draw_bind_mesh = false;
+
+    load_environment_heightmap();
     
     // Scene Obstacles
     
-    array1d<vec3> obstacles_positions(3);
-    array1d<vec3> obstacles_scales(3);
-    
-    obstacles_positions(0) = vec3(5.0f, 0.0f, 6.0f);
-    obstacles_positions(1) = vec3(-3.0f, 0.0f, -5.0f);
-    obstacles_positions(2) = vec3(-8.0f, 0.0f, 3.0f);
-    
-    obstacles_scales(0) = vec3(2.0f, 1.0f, 5.0f);
-    obstacles_scales(1) = vec3(4.0f, 1.0f, 4.0f);
-    obstacles_scales(2) = vec3(2.0f, 1.0f, 2.0f);
-    
+    array1d<environment_box> environment_boxes(0);
+    initialize_environment_boxes(environment_boxes);
+
     // Ground Plane
     
-    Shader ground_plane_shader = LoadShader("./resources/checkerboard.vs", "./resources/checkerboard.fs");
-    Mesh ground_plane_mesh = GenMeshPlane(20.0f, 20.0f, 10, 10);
+    Shader ground_plane_shader = LoadShader(
+        CHECKERBOARD_VERTEX_SHADER_FILENAME,
+        CHECKERBOARD_FRAGMENT_SHADER_FILENAME);
+    float terrain_span_x = g_environment_heightmap.loaded() ? (g_environment_heightmap.x_max - g_environment_heightmap.x_min) : 28.0f;
+    float terrain_span_z = g_environment_heightmap.loaded() ? (g_environment_heightmap.z_max - g_environment_heightmap.z_min) : 28.0f;
+    int terrain_slices_x = g_environment_heightmap.loaded() ? (g_environment_heightmap.width > 2 ? g_environment_heightmap.width - 1 : 2) : 80;
+    int terrain_slices_z = g_environment_heightmap.loaded() ? (g_environment_heightmap.height > 2 ? g_environment_heightmap.height - 1 : 2) : 80;
+    float terrain_center_x = g_environment_heightmap.loaded() ? 0.5f * (g_environment_heightmap.x_min + g_environment_heightmap.x_max) : 0.0f;
+    float terrain_center_z = g_environment_heightmap.loaded() ? 0.5f * (g_environment_heightmap.z_min + g_environment_heightmap.z_max) : 0.0f;
+
+    Mesh ground_plane_mesh = GenMeshPlane(terrain_span_x, terrain_span_z, terrain_slices_x, terrain_slices_z);
+    terrain_mesh_offset_xz(ground_plane_mesh, terrain_center_x, terrain_center_z);
+    terrain_mesh_apply_heightfield(ground_plane_mesh);
     Model ground_plane_model = LoadModelFromMesh(ground_plane_mesh);
     ground_plane_model.materials[0].shader = ground_plane_shader;
+
+    auto rebuild_environment_scene = [&]()
+    {
+        terrain_mesh_apply_heightfield(ground_plane_mesh, true);
+    };
+
+    rebuild_environment_scene();
     
     // Character
     
     character character_data;
     character_load(character_data, "./resources/character.bin");
     
-    Shader character_shader = LoadShader("./resources/character.vs", "./resources/character.fs");
+    Shader character_shader = LoadShader(
+        CHARACTER_VERTEX_SHADER_FILENAME,
+        CHARACTER_FRAGMENT_SHADER_FILENAME);
     Mesh character_mesh = make_character_mesh(character_data);
     Model character_model = LoadModelFromMesh(character_mesh);
     character_model.materials[0].shader = character_shader;
@@ -1263,16 +1839,24 @@ int main(void)
     float feature_weight_hip_velocity = 1.0f;
     float feature_weight_trajectory_positions = 1.0f;
     float feature_weight_trajectory_directions = 1.5f;
-    
-    database_build_matching_features(
-        db,
-        feature_weight_foot_position,
-        feature_weight_foot_velocity,
-        feature_weight_hip_velocity,
-        feature_weight_trajectory_positions,
-        feature_weight_trajectory_directions);
-        
-    database_save_matching_features(db, "./resources/features.bin");
+    float feature_weight_environment = 1.0f;
+
+    auto rebuild_matching_database = [&]()
+    {
+        database_build_matching_features(
+            db,
+            feature_weight_foot_position,
+            feature_weight_foot_velocity,
+            feature_weight_hip_velocity,
+            feature_weight_trajectory_positions,
+            feature_weight_trajectory_directions,
+            feature_weight_environment,
+            PFNN_ENVIRONMENT_FEATURES_FILENAME);
+
+        database_save_matching_features(db, "./resources/features.bin");
+    };
+
+    rebuild_matching_database();
    
     // Pose & Inertializer Data
     
@@ -1482,6 +2066,11 @@ int main(void)
     decompressor_evaluation.resize(decompressor);
     stepper_evaluation.resize(stepper);
     projector_evaluation.resize(projector);
+    bool lmm_networks_compatible =
+        decompressor.input_mean.size == db.nfeatures() + 32 &&
+        stepper.input_mean.size == db.nfeatures() + 32 &&
+        projector.input_mean.size == db.nfeatures();
+    lmm_enabled = lmm_networks_compatible;
 
     array1d<float> features_proj = db.features(frame_index);
     array1d<float> features_curr = db.features(frame_index);
@@ -1492,8 +2081,44 @@ int main(void)
 
     float dt = 1.0f / 60.0f;
 
+    simulation_position = vec3(0.0f, environment_surface_height(0.0f, 0.0f, environment_boxes), 0.0f);
+    simulation_velocity = vec3();
+    simulation_acceleration = vec3();
+    simulation_rotation = quat();
+    simulation_angular_velocity = vec3();
+    desired_velocity = vec3();
+    desired_velocity_change_curr = vec3();
+    desired_velocity_change_prev = vec3();
+    desired_rotation = quat();
+    desired_rotation_change_curr = vec3();
+    desired_rotation_change_prev = vec3();
+
     auto update_func = [&]()
     {
+        if (IsKeyPressed(KEY_T))
+        {
+            terrain_preview_enabled = !terrain_preview_enabled;
+        }
+        if (IsKeyPressed(KEY_B))
+        {
+            debug_draw_skeleton = !debug_draw_skeleton;
+        }
+        if (IsKeyPressed(KEY_M))
+        {
+            debug_draw_mesh = !debug_draw_mesh;
+        }
+        if (IsKeyPressed(KEY_N))
+        {
+            debug_draw_bind_skeleton = !debug_draw_bind_skeleton;
+        }
+        if (IsKeyPressed(KEY_R))
+        {
+            debug_draw_bind_mesh = !debug_draw_bind_mesh;
+        }
+        if (IsKeyPressed(KEY_I))
+        {
+            ik_enabled = !ik_enabled;
+        }
       
         // Get gamepad stick states
         vec3 gamepadstick_left = gamepad_get_stick(GAMEPAD_STICK_LEFT);
@@ -1600,8 +2225,7 @@ int main(void)
             trajectory_desired_velocities,
             simulation_velocity_halflife,
             20.0f * dt,
-            obstacles_positions,
-            obstacles_scales);
+            environment_boxes);
            
         // Make query vector for search.
         // In theory this only needs to be done when a search is 
@@ -1621,6 +2245,17 @@ int main(void)
         query_copy_denormalized_feature(query, offset, 3, query_features, db.features_offset, db.features_scale); // Hip Velocity
         query_compute_trajectory_position_feature(query, offset, bone_positions(0), bone_rotations(0), trajectory_positions);
         query_compute_trajectory_direction_feature(query, offset, bone_rotations(0), trajectory_rotations);
+        if (offset < db.nfeatures())
+        {
+            query_compute_environment_feature(
+                query,
+                offset,
+                bone_positions(0),
+                trajectory_positions,
+                trajectory_rotations,
+                environment_boxes,
+                db.nfeatures() - offset);
+        }
         
         assert(offset == db.nfeatures());
 
@@ -1630,7 +2265,7 @@ int main(void)
         // Do we need to search?
         if (force_search || search_timer <= 0.0f || end_of_anim)
         {
-            if (lmm_enabled)
+            if (lmm_enabled && lmm_networks_compatible)
             {
                 // Project query onto nearest feature vector
                 
@@ -1750,7 +2385,7 @@ int main(void)
         // Tick down search timer
         search_timer -= dt;
 
-        if (lmm_enabled)
+        if (lmm_enabled && lmm_networks_compatible)
         {
             // Update features and latents
             stepper_evaluate(
@@ -1821,8 +2456,7 @@ int main(void)
             desired_velocity,
             simulation_velocity_halflife,
             dt,
-            obstacles_positions,
-            obstacles_scales);
+            environment_boxes);
             
         simulation_rotations_update(
             simulation_rotation, 
@@ -1848,8 +2482,7 @@ int main(void)
             synchronized_position = simulation_collide_obstacles(
                 simulation_position_prev,
                 synchronized_position,
-                obstacles_positions,
-                obstacles_scales);
+                environment_boxes);
             
             simulation_position = synchronized_position;
             simulation_rotation = synchronized_rotation;
@@ -1976,6 +2609,11 @@ int main(void)
                     toe_bone);
                 
                 // Update the contact state
+                float toe_ground_height = environment_surface_height(
+                    global_bone_positions(toe_bone).x,
+                    global_bone_positions(toe_bone).z,
+                    environment_boxes);
+
                 contact_update(
                     contact_states(i),
                     contact_locks(i),
@@ -1988,13 +2626,14 @@ int main(void)
                     global_bone_positions(toe_bone),
                     curr_bone_contacts(i),
                     ik_unlock_radius,
+                    toe_ground_height,
                     ik_foot_height,
                     ik_blending_halflife,
                     dt);
                 
                 // Ensure contact position never goes through floor
                 vec3 contact_position_clamp = contact_positions(i);
-                contact_position_clamp.y = maxf(contact_position_clamp.y, ik_foot_height);
+                contact_position_clamp.y = maxf(contact_position_clamp.y, toe_ground_height + ik_foot_height);
                 
                 // Re-compute toe, heel, knee, hip, and root bone positions
                 for (int bone : {heel_bone, knee_bone, hip_bone, root_bone})
@@ -2069,7 +2708,11 @@ int main(void)
                     global_bone_positions(toe_bone);
                     
                 vec3 toe_end_targ = toe_end_curr;
-                toe_end_targ.y = maxf(toe_end_targ.y, ik_foot_height);
+                float toe_end_ground_height = environment_surface_height(
+                    toe_end_targ.x,
+                    toe_end_targ.z,
+                    environment_boxes);
+                toe_end_targ.y = maxf(toe_end_targ.y, toe_end_ground_height + ik_foot_height);
                 
                 ik_look_at(
                     adjusted_bone_rotations(toe_bone),
@@ -2094,16 +2737,31 @@ int main(void)
         
         // Update camera
         
-        orbit_camera_update(
-            camera, 
-            camera_azimuth,
-            camera_altitude,
-            camera_distance,
-            bone_positions(0) + vec3(0, 1, 0),
-            // simulation_position + vec3(0, 1, 0),
-            gamepadstick_right,
-            desired_strafe,
-            dt);
+        if (terrain_preview_enabled)
+        {
+            vec3 preview_target = simulation_position;
+            preview_target.y = environment_base_height(preview_target.x, preview_target.z);
+
+            camera.position = (Vector3){ preview_target.x, preview_target.y + 18.0f, preview_target.z + 0.001f };
+            camera.target = (Vector3){ preview_target.x, preview_target.y, preview_target.z };
+            camera.up = (Vector3){ 0.0f, 0.0f, -1.0f };
+            camera.fovy = 35.0f;
+        }
+        else
+        {
+            camera.up = (Vector3){ 0.0f, 1.0f, 0.0f };
+            camera.fovy = 45.0f;
+
+            orbit_camera_update(
+                camera, 
+                camera_azimuth,
+                camera_altitude,
+                camera_distance,
+                bone_positions(0) + vec3(0, 1, 0),
+                gamepadstick_right,
+                desired_strafe,
+                dt);
+        }
 
         // Render
         
@@ -2157,18 +2815,34 @@ int main(void)
             trajectory_rotations,
             ORANGE);
         
-        draw_obstacles(
-            obstacles_positions,
-            obstacles_scales);
+        draw_environment_boxes(environment_boxes);
         
-        deform_character_mesh(
-            character_mesh, 
-            character_data, 
-            global_bone_positions, 
-            global_bone_rotations,
-            db.bone_parents);
-        
-        DrawModel(character_model, (Vector3){0.0f, 0.0f, 0.0f}, 1.0f, RAYWHITE);
+        if (debug_draw_mesh)
+        {
+            deform_character_mesh(
+                character_mesh, 
+                character_data, 
+                debug_draw_bind_mesh ? slice1d<vec3>(character_data.bone_rest_positions) : slice1d<vec3>(global_bone_positions), 
+                debug_draw_bind_mesh ? slice1d<quat>(character_data.bone_rest_rotations) : slice1d<quat>(global_bone_rotations),
+                db.bone_parents);
+            
+            DrawModel(character_model, (Vector3){0.0f, 0.0f, 0.0f}, 1.0f, RAYWHITE);
+        }
+
+        if (debug_draw_skeleton)
+        {
+            draw_skeleton(global_bone_positions, db.bone_parents, DARKGRAY, BLACK);
+        }
+
+        if (debug_draw_bind_skeleton)
+        {
+            draw_skeleton(
+                character_data.bone_rest_positions,
+                db.bone_parents,
+                BLUE,
+                ORANGE,
+                vec3(0.35f, 0.0f, 0.0f));
+        }
         
         // Draw matched features
         
@@ -2268,25 +2942,37 @@ int main(void)
             (Rectangle){ 1000, ui_lmm_hei + 10, 20, 20 }, 
             "enabled",
             &lmm_enabled);
+        if (!lmm_networks_compatible)
+        {
+            GuiLabel((Rectangle){ 1065, ui_lmm_hei + 10, 185, 20 }, "retrain nets for env sdf");
+            lmm_enabled = false;
+        }
         
         //---------
         
         float ui_ctrl_hei = 380;
         
-        GuiGroupBox((Rectangle){ 1010, ui_ctrl_hei, 250, 140 }, "controls");
+        GuiGroupBox((Rectangle){ 1010, ui_ctrl_hei, 250, 260 }, "controls");
+        GuiLabel((Rectangle){ 1030, ui_ctrl_hei - 20, 210, 20 }, PFNN_HEIGHTMAP_LABEL);
+        GuiLabel((Rectangle){ 1030, ui_ctrl_hei +  20, 200, 20 }, terrain_preview_enabled ? "T Topdown Preview: ON" : "T Topdown Preview: OFF");
         
-        GuiLabel((Rectangle){ 1030, ui_ctrl_hei +  10, 200, 20 }, "Left Trigger - Strafe");
-        GuiLabel((Rectangle){ 1030, ui_ctrl_hei +  30, 200, 20 }, "Left Stick - Move");
-        GuiLabel((Rectangle){ 1030, ui_ctrl_hei +  50, 200, 20 }, "Right Stick - Camera / Facing (Stafe)");
-        GuiLabel((Rectangle){ 1030, ui_ctrl_hei +  70, 200, 20 }, "Left Shoulder - Zoom In");
-        GuiLabel((Rectangle){ 1030, ui_ctrl_hei +  90, 200, 20 }, "Right Shoulder - Zoom Out");
-        GuiLabel((Rectangle){ 1030, ui_ctrl_hei + 110, 200, 20 }, "A Button - Walk");
+        GuiLabel((Rectangle){ 1030, ui_ctrl_hei +  40, 200, 20 }, "Left Trigger - Strafe");
+        GuiLabel((Rectangle){ 1030, ui_ctrl_hei +  60, 200, 20 }, "WASD / Left Stick - Move");
+        GuiLabel((Rectangle){ 1030, ui_ctrl_hei +  80, 200, 20 }, "RMB / Arrows / Right Stick - Camera");
+        GuiLabel((Rectangle){ 1030, ui_ctrl_hei + 100, 200, 20 }, "Left Shoulder - Zoom In");
+        GuiLabel((Rectangle){ 1030, ui_ctrl_hei + 120, 200, 20 }, "Right Shoulder - Zoom Out");
+        GuiLabel((Rectangle){ 1030, ui_ctrl_hei + 140, 200, 20 }, "A Button - Walk");
+        GuiLabel((Rectangle){ 1030, ui_ctrl_hei + 160, 200, 20 }, debug_draw_mesh ? "M Mesh: ON" : "M Mesh: OFF");
+        GuiLabel((Rectangle){ 1030, ui_ctrl_hei + 180, 200, 20 }, debug_draw_skeleton ? "B Skeleton: ON" : "B Skeleton: OFF");
+        GuiLabel((Rectangle){ 1030, ui_ctrl_hei + 200, 200, 20 }, ik_enabled ? "I IK: ON" : "I IK: OFF");
+        GuiLabel((Rectangle){ 1030, ui_ctrl_hei + 220, 200, 20 }, debug_draw_bind_skeleton ? "N Bind Skeleton: ON" : "N Bind Skeleton: OFF");
+        GuiLabel((Rectangle){ 1030, ui_ctrl_hei + 240, 200, 20 }, debug_draw_bind_mesh ? "R Bind Mesh: ON" : "R Bind Mesh: OFF");
         
 
         
         //---------
         
-        GuiGroupBox((Rectangle){ 20, 20, 290, 190 }, "feature weights");
+        GuiGroupBox((Rectangle){ 20, 20, 290, 220 }, "feature weights");
         
         GuiSliderBar(
             (Rectangle){ 150, 30, 120, 20 }, 
@@ -2317,16 +3003,15 @@ int main(void)
             "trajectory directions", 
             TextFormat("%5.3f", feature_weight_trajectory_directions), 
             &feature_weight_trajectory_directions, 0.001f, 3.0f);
+        GuiSliderBar(
+            (Rectangle){ 150, 180, 120, 20 },
+            "environment",
+            TextFormat("%5.3f", feature_weight_environment),
+            &feature_weight_environment, 0.001f, 3.0f);
             
-        if (GuiButton((Rectangle){ 150, 180, 120, 20 }, "rebuild database"))
+        if (GuiButton((Rectangle){ 150, 210, 120, 20 }, "rebuild database"))
         {
-            database_build_matching_features(
-                db,
-                feature_weight_foot_position,
-                feature_weight_foot_velocity,
-                feature_weight_hip_velocity,
-                feature_weight_trajectory_positions,
-                feature_weight_trajectory_directions);
+            rebuild_matching_database();
         }
         
         //---------

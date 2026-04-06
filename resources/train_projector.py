@@ -1,5 +1,6 @@
 import sys
 import struct
+import argparse
 
 import numpy as np
 import tquat
@@ -12,7 +13,21 @@ import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.tensorboard import SummaryWriter
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except ModuleNotFoundError:
+    class SummaryWriter:  # type: ignore[override]
+        def add_scalar(self, *args, **kwargs):
+            pass
+
+        def add_scalars(self, *args, **kwargs):
+            pass
+
+        def flush(self):
+            pass
+
+        def close(self):
+            pass
 
 from sklearn.neighbors import BallTree
 
@@ -40,7 +55,19 @@ class Projector(nn.Module):
 
 # Training procedure
 
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--device', default=None)
+    parser.add_argument('--gpu', type=int, default=0)
+    parser.add_argument('--batchsize', type=int, default=32)
+    parser.add_argument('--niter', type=int, default=100000)
+    parser.add_argument('--save-every', type=int, default=1000)
+    parser.add_argument('--lr', type=float, default=0.001)
+    parser.add_argument('--nn-chunk', type=int, default=65536)
+    return parser.parse_args()
+
 if __name__ == '__main__':
+    args = parse_args()
     
     # Load data
     
@@ -59,17 +86,36 @@ if __name__ == '__main__':
     # Parameters
     
     seed = 1234
-    batchsize = 32
-    lr = 0.001
-    niter = 500000
+    batchsize = args.batchsize
+    lr = args.lr
+    niter = args.niter
+
+    if args.device is not None:
+        device = torch.device(args.device)
+    elif torch.cuda.is_available():
+        device = torch.device(f'cuda:{args.gpu}')
+    else:
+        device = torch.device('cpu')
     
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.set_num_threads(1)
+    if device.type == 'cuda':
+        torch.cuda.set_device(device)
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+    print(f'Using device: {device}')
     
     # Fit acceleration structure for nearest neighbors search
-    
-    tree = BallTree(X)
+
+    if device.type == 'cuda':
+        X_db_device = torch.as_tensor(X, device=device)
+        X_db_sqnorm = torch.sum(torch.square(X_db_device), dim=1)
+        tree = None
+    else:
+        tree = BallTree(X)
+        X_db_device = None
+        X_db_sqnorm = None
     
     # Compute means/stds
     
@@ -79,24 +125,48 @@ if __name__ == '__main__':
     projector_mean_out = torch.as_tensor(np.hstack([
         X.mean(axis=0).ravel(),
         Z.mean(axis=0).ravel(),
-    ]).astype(np.float32))
+    ]).astype(np.float32), device=device)
     
     projector_std_out = torch.as_tensor(np.hstack([
         X.std(axis=0).ravel(),
         Z.std(axis=0).ravel(),
-    ]).astype(np.float32))
+    ]).astype(np.float32), device=device)
     
     projector_mean_in = torch.as_tensor(np.hstack([
         X.mean(axis=0).ravel(),
-    ]).astype(np.float32))
+    ]).astype(np.float32), device=device)
     
     projector_std_in = torch.as_tensor(np.hstack([
-        X_scale.repeat(nfeatures),
-    ]).astype(np.float32))
+        np.repeat(X_scale, nfeatures),
+    ]).astype(np.float32), device=device)
     
     # Make networks
     
-    network_projector = Projector(nfeatures, nfeatures + nlatent)
+    network_projector = Projector(nfeatures, nfeatures + nlatent).to(device)
+
+    def nearest_neighbor_search(xhat_np):
+        if device.type != 'cuda':
+            return tree.query(xhat_np, k=1, return_distance=False)[:,0]
+
+        xhat = torch.as_tensor(xhat_np, device=device)
+        xhat_sqnorm = torch.sum(torch.square(xhat), dim=1)
+        best_dist = torch.full((xhat.shape[0],), float('inf'), device=device)
+        best_idx = torch.zeros((xhat.shape[0],), dtype=torch.long, device=device)
+
+        for start_idx in range(0, nframes, args.nn_chunk):
+            stop_idx = min(start_idx + args.nn_chunk, nframes)
+            chunk = X_db_device[start_idx:stop_idx]
+            dist = (
+                xhat_sqnorm[:, None] +
+                X_db_sqnorm[start_idx:stop_idx][None, :] -
+                2.0 * torch.matmul(xhat, chunk.T)
+            )
+            chunk_best_dist, chunk_best_idx = torch.min(dist, dim=1)
+            improved = chunk_best_dist < best_dist
+            best_dist[improved] = chunk_best_dist[improved]
+            best_idx[improved] = start_idx + chunk_best_idx[improved]
+
+        return best_idx.cpu().numpy()
     
     # Function to generate test predictions
 
@@ -115,11 +185,11 @@ if __name__ == '__main__':
             
             # Find nearest
             
-            nearest = tree.query(Xhat, k=1, return_distance=False)[:,0]
+            nearest = nearest_neighbor_search(Xhat)
             
-            Xgnd = torch.as_tensor(X[nearest])
-            Zgnd = torch.as_tensor(Z[nearest])
-            Xhat = torch.as_tensor(Xhat)
+            Xgnd = torch.as_tensor(X[nearest], device=device)
+            Zgnd = torch.as_tensor(Z[nearest], device=device)
+            Xhat = torch.as_tensor(Xhat, device=device)
             
             # Project
             
@@ -196,11 +266,11 @@ if __name__ == '__main__':
         
         # Find nearest
         
-        nearest = tree.query(Xhat, k=1, return_distance=False)[:,0]
+        nearest = nearest_neighbor_search(Xhat)
         
-        Xgnd = torch.as_tensor(X[nearest])
-        Zgnd = torch.as_tensor(Z[nearest])
-        Xhat = torch.as_tensor(Xhat)
+        Xgnd = torch.as_tensor(X[nearest], device=device)
+        Zgnd = torch.as_tensor(Z[nearest], device=device)
+        Xhat = torch.as_tensor(Xhat, device=device)
         Dgnd = torch.sqrt(torch.sum(torch.square(Xhat - Xgnd), dim=-1))
         
         # Projector
@@ -243,7 +313,7 @@ if __name__ == '__main__':
         if i % 10 == 0:
             sys.stdout.write('\rIter: %7i Loss: %5.3f' % (i, rolling_loss))
         
-        if i % 1000 == 0:
+        if i % args.save_every == 0:
             generate_predictions()
             save_network('projector.bin', [
                 network_projector.linear0, 
@@ -256,6 +326,6 @@ if __name__ == '__main__':
                 projector_mean_out,
                 projector_std_out)
             
-        if i % 1000 == 0:
+        if i % args.save_every == 0:
             scheduler.step()
             
