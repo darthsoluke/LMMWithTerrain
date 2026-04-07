@@ -18,6 +18,7 @@
 
 #include <initializer_list>
 #include <functional>
+#include <string>
 #include <vector>
 
 //--------------------------------------
@@ -151,15 +152,91 @@ struct environment_heightmap
 };
 
 static environment_heightmap g_environment_heightmap;
+struct terrain_sampling_config_cpp
+{
+    std::vector<int> environment_horizons = { 10, 20, 40, 60, 80 };
+    std::vector<int> matching_trajectory_horizons = { 20, 40, 60 };
+    int prediction_frame_step = 10;
+    float strip_half_width = 0.25f;
+    float sdf_clamp_distance = 2.5f;
+};
+
+static terrain_sampling_config_cpp g_terrain_sampling_config;
+struct eval_input_sample
+{
+    float left_x = 0.0f;
+    float left_z = 0.0f;
+    float right_x = 0.0f;
+    float right_z = 0.0f;
+    float gait = 0.0f;
+    bool strafe = false;
+};
+
+struct eval_config_cpp
+{
+    bool enabled = false;
+    bool use_learned = false;
+    std::string script_path;
+    std::string trace_path;
+    std::string tag = "default";
+    std::string selector_mode = "learned";
+    std::string residual_mode = "learned";
+    std::string failure_dump_dir;
+    float start_x = 0.0f;
+    float start_z = 0.0f;
+    float start_yaw = 0.0f;
+    int frames = 0;
+};
+
+static eval_config_cpp g_eval_config;
+static std::vector<eval_input_sample> g_eval_script;
+
+struct runtime_debug_snapshot
+{
+    int frame = 0;
+    int teacher_frame = -1;
+    int selected_exemplar = -1;
+    bool exemplar_valid = false;
+    bool switch_flag = false;
+    bool divergence_flag = false;
+    bool finite_query = true;
+    bool finite_features = true;
+    bool finite_latent = true;
+    bool finite_residual = true;
+    bool finite_stepper = true;
+    bool finite_decompressor = true;
+    bool finite_pose = true;
+    float residual_norm_before = 0.0f;
+    float residual_norm_after = 0.0f;
+    float stepper_input_norm = 0.0f;
+    float stepper_output_norm = 0.0f;
+    float decompressor_input_norm = 0.0f;
+    float root_planar_speed = 0.0f;
+    float contact_slip = 0.0f;
+    float correction_magnitude = 0.0f;
+    float switch_severity = 0.0f;
+    float residual_carry_alpha = 1.0f;
+    float selector_margin = 0.0f;
+    int exemplar_dwell_frames = 0;
+    bool emergency_reanchor = false;
+    bool hard_reset = false;
+    std::vector<int> topk_indices;
+    std::vector<float> topk_costs;
+    std::vector<float> selector_scores;
+    std::vector<float> query_normalized;
+    std::vector<float> features_curr;
+    std::vector<float> latent_curr;
+    std::vector<float> residual_features;
+    std::vector<float> residual_latent;
+    std::vector<float> stepper_control;
+};
 static const char* PFNN_HEIGHTMAP_LABEL = "PFNN Rocky";
 static const char* PFNN_TERRAIN_GRID_FILENAME = "./resources/pfnn_terrain_rocky_grid.bin";
 static const char* PFNN_ENVIRONMENT_FEATURES_FILENAME = "resources/terrain_features.bin";
 static const char* PFNN_ENVIRONMENT_BOXES_FILENAME = "./resources/environment_boxes.txt";
-static const int MOTION_MATCH_BASE_FEATURE_COUNT = 27;
-static const int PFNN_TERRAIN_FEATURE_COUNT = 9;
-static const int PFNN_OBSTACLE_SDF_FEATURE_COUNT = 9;
-static const float PFNN_TERRAIN_STRIP_HALF_WIDTH = 0.25f;
-static const float PFNN_OBSTACLE_SDF_CLAMP_DISTANCE = 2.5f;
+static const char* PFNN_TERRAIN_CONFIG_FILENAME = "./resources/terrain_sampling_config.txt";
+static const int MOTION_MATCH_PHASE_CONTACT_FEATURE_COUNT = 4;
+static const int MOTION_MATCH_BASE_FEATURE_COUNT = 31;
 #if defined(PLATFORM_WEB)
 static const char* CHECKERBOARD_VERTEX_SHADER_FILENAME = "./resources/checkerboard.vs";
 static const char* CHECKERBOARD_FRAGMENT_SHADER_FILENAME = "./resources/checkerboard.fs";
@@ -174,6 +251,491 @@ static const char* CHARACTER_FRAGMENT_SHADER_FILENAME = "./resources/character_3
 static bool load_environment_heightmap()
 {
     return g_environment_heightmap.load(PFNN_TERRAIN_GRID_FILENAME);
+}
+
+static int terrain_feature_count()
+{
+    return 3 * (int)g_terrain_sampling_config.environment_horizons.size();
+}
+
+static int obstacle_sdf_feature_count()
+{
+    return terrain_feature_count();
+}
+
+static int control_feature_count(const int nfeatures)
+{
+    return std::max(nfeatures - 15, 0);
+}
+
+static const float HYBRID_RESIDUAL_NORM_P99 = 4.5259f;
+static const float HYBRID_RESIDUAL_NORM_MAX = 32.0961f;
+static const float HYBRID_STEPPER_INPUT_NORM_P99 = 25.1601f;
+static const float HYBRID_STEPPER_INPUT_NORM_MAX = 72.4039f;
+static const float HYBRID_FEATURE_DELTA_NORM_P95 = 2.7136f;
+static const float HYBRID_CONTROL_DELTA_NORM_P95 = 2.4202f;
+static const float HYBRID_PHASE_CONTACT_DELTA_NORM_P95 = 0.7789f;
+static const float HYBRID_SWITCH_SOFT_SEVERITY = 2.0f;
+static const float HYBRID_SWITCH_MEDIUM_SEVERITY = 3.5f;
+static const float HYBRID_SWITCH_HARD_SEVERITY = 5.0f;
+static const float HYBRID_CARRY_ALPHA_SOFT = 0.6f;
+static const float HYBRID_CARRY_ALPHA_MEDIUM = 0.25f;
+static const int HYBRID_SELECTOR_MIN_DWELL_FRAMES = 6;
+static const float HYBRID_SELECTOR_SCORE_MARGIN = 4096.0f;
+static const float HYBRID_CONTACT_SLIP_GUARD = 10.0f;
+static const float HYBRID_CONTACT_SLIP_HARD_RESET = 25.0f;
+static const int STARTUP_BOOTSTRAP_WINDOW_FRAMES = 8;
+static const float STARTUP_SEVERE_PENETRATION = 0.05f;
+
+static float slice_l2_distance(
+    const slice1d<float> a,
+    const slice1d<float> b,
+    const int start,
+    const int count)
+{
+    float accum = 0.0f;
+    for (int i = 0; i < count; i++)
+    {
+        float delta = a(start + i) - b(start + i);
+        accum += delta * delta;
+    }
+    return sqrtf(accum);
+}
+
+static float contact_state_mismatch(
+    const slice1d<bool> contacts,
+    const slice1d<bool> exemplar_contacts)
+{
+    int mismatches = 0;
+    int count = std::min(contacts.size, exemplar_contacts.size);
+    for (int i = 0; i < count; i++)
+    {
+        mismatches += contacts(i) != exemplar_contacts(i) ? 1 : 0;
+    }
+    return count > 0 ? (float)mismatches / (float)count : 0.0f;
+}
+
+static float hybrid_switch_severity(
+    const slice1d<float> features_curr,
+    const slice1d<float> exemplar_features,
+    const slice1d<bool> curr_contacts,
+    const slice1d<bool> exemplar_contacts)
+{
+    float feature_delta = slice_l2_distance(features_curr, exemplar_features, 0, features_curr.size);
+    float control_delta = slice_l2_distance(features_curr, exemplar_features, 15, control_feature_count(features_curr.size));
+    float phase_contact_delta = slice_l2_distance(features_curr, exemplar_features, 27, MOTION_MATCH_PHASE_CONTACT_FEATURE_COUNT);
+    float contact_mismatch = contact_state_mismatch(curr_contacts, exemplar_contacts);
+
+    return
+        feature_delta / HYBRID_FEATURE_DELTA_NORM_P95 +
+        0.5f * (control_delta / HYBRID_CONTROL_DELTA_NORM_P95) +
+        0.5f * (phase_contact_delta / HYBRID_PHASE_CONTACT_DELTA_NORM_P95) +
+        1.5f * contact_mismatch;
+}
+
+static float hybrid_residual_norm(
+    const slice1d<float> residual_features,
+    const slice1d<float> residual_latent)
+{
+    float residual_feature_norm = 0.0f;
+    float residual_latent_norm = 0.0f;
+    for (int i = 0; i < residual_features.size; i++)
+    {
+        residual_feature_norm += squaref(residual_features(i));
+    }
+    for (int i = 0; i < residual_latent.size; i++)
+    {
+        residual_latent_norm += squaref(residual_latent(i));
+    }
+    return sqrtf(
+        residual_feature_norm +
+        residual_latent_norm);
+}
+
+static void hybrid_reconstruct_absolute_state(
+    slice1d<float> features_curr,
+    slice1d<float> latent_curr,
+    const slice1d<float> anchor_features,
+    const slice1d<float> anchor_latent,
+    const slice1d<float> residual_features,
+    const slice1d<float> residual_latent)
+{
+    for (int i = 0; i < features_curr.size; i++)
+    {
+        features_curr(i) = anchor_features(i) + residual_features(i);
+    }
+    for (int i = 0; i < latent_curr.size; i++)
+    {
+        latent_curr(i) = anchor_latent(i) + residual_latent(i);
+    }
+}
+
+static int prediction_sample_count()
+{
+    int max_horizon = 0;
+    for (int horizon : g_terrain_sampling_config.environment_horizons)
+    {
+        max_horizon = std::max(max_horizon, horizon);
+    }
+    for (int horizon : g_terrain_sampling_config.matching_trajectory_horizons)
+    {
+        max_horizon = std::max(max_horizon, horizon);
+    }
+    return 1 + max_horizon / std::max(g_terrain_sampling_config.prediction_frame_step, 1);
+}
+
+static int prediction_index_for_horizon(const int horizon)
+{
+    return horizon / std::max(g_terrain_sampling_config.prediction_frame_step, 1);
+}
+
+static int environment_feature_offset_for_horizon(const int horizon)
+{
+    for (int i = 0; i < (int)g_terrain_sampling_config.environment_horizons.size(); i++)
+    {
+        if (g_terrain_sampling_config.environment_horizons[i] == horizon)
+        {
+            return i * 3;
+        }
+    }
+    return -1;
+}
+
+static bool parse_int_list(std::vector<int>& values, const std::string& text)
+{
+    values.clear();
+    size_t start = 0;
+    while (start < text.size())
+    {
+        size_t end = text.find(',', start);
+        std::string token = text.substr(start, end == std::string::npos ? std::string::npos : end - start);
+        if (!token.empty())
+        {
+            values.push_back(atoi(token.c_str()));
+        }
+        if (end == std::string::npos)
+        {
+            break;
+        }
+        start = end + 1;
+        while (start < text.size() && text[start] == ' ')
+        {
+            start++;
+        }
+    }
+    return !values.empty();
+}
+
+static bool load_terrain_sampling_config(const char* filename)
+{
+    FILE* f = fopen(filename, "r");
+    if (f == NULL)
+    {
+        return false;
+    }
+
+    terrain_sampling_config_cpp config;
+    char line[256];
+    while (fgets(line, sizeof(line), f) != NULL)
+    {
+        if (line[0] == '#' || line[0] == '\n' || line[0] == '\r')
+        {
+            continue;
+        }
+
+        char* eq = strchr(line, '=');
+        if (eq == NULL)
+        {
+            continue;
+        }
+
+        *eq = '\0';
+        std::string key(line);
+        std::string value(eq + 1);
+        while (!value.empty() && (value.back() == '\n' || value.back() == '\r'))
+        {
+            value.pop_back();
+        }
+
+        if (key == "environment_horizons")
+        {
+            parse_int_list(config.environment_horizons, value);
+        }
+        else if (key == "matching_trajectory_horizons")
+        {
+            parse_int_list(config.matching_trajectory_horizons, value);
+        }
+        else if (key == "prediction_frame_step")
+        {
+            config.prediction_frame_step = atoi(value.c_str());
+        }
+        else if (key == "strip_half_width")
+        {
+            config.strip_half_width = atof(value.c_str());
+        }
+        else if (key == "sdf_clamp_distance")
+        {
+            config.sdf_clamp_distance = atof(value.c_str());
+        }
+    }
+
+    fclose(f);
+
+    if (config.environment_horizons.empty() || config.matching_trajectory_horizons.size() != 3 || config.prediction_frame_step <= 0)
+    {
+        return false;
+    }
+
+    g_terrain_sampling_config = config;
+    return true;
+}
+
+static bool file_exists(const char* filename)
+{
+    FILE* f = fopen(filename, "rb");
+    if (f == NULL)
+    {
+        return false;
+    }
+    fclose(f);
+    return true;
+}
+
+static float array_norm(const slice1d<float> values)
+{
+    float total = 0.0f;
+    for (int i = 0; i < values.size; i++)
+    {
+        total += squaref(values(i));
+    }
+    return sqrtf(total);
+}
+
+static bool array_is_finite(const slice1d<float> values)
+{
+    for (int i = 0; i < values.size; i++)
+    {
+        if (!isfinite(values(i)))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool vec3_array_is_finite(const slice1d<vec3> values)
+{
+    for (int i = 0; i < values.size; i++)
+    {
+        if (!isfinite(values(i).x) || !isfinite(values(i).y) || !isfinite(values(i).z))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+static std::vector<float> copy_array(const slice1d<float> values)
+{
+    std::vector<float> out(values.size);
+    for (int i = 0; i < values.size; i++)
+    {
+        out[i] = values(i);
+    }
+    return out;
+}
+
+static std::vector<int> copy_array_int(const slice1d<int> values)
+{
+    std::vector<int> out(values.size);
+    for (int i = 0; i < values.size; i++)
+    {
+        out[i] = values(i);
+    }
+    return out;
+}
+
+static void write_debug_vector(FILE* f, const char* label, const std::vector<float>& values)
+{
+    fprintf(f, "%s:", label);
+    for (float value : values)
+    {
+        fprintf(f, " %.9g", value);
+    }
+    fprintf(f, "\n");
+}
+
+static void write_debug_vector_int(FILE* f, const char* label, const std::vector<int>& values)
+{
+    fprintf(f, "%s:", label);
+    for (int value : values)
+    {
+        fprintf(f, " %d", value);
+    }
+    fprintf(f, "\n");
+}
+
+static void write_runtime_snapshot(FILE* f, const runtime_debug_snapshot& snapshot)
+{
+    fprintf(
+        f,
+        "frame=%d teacher_frame=%d selected_exemplar=%d exemplar_valid=%d switch=%d divergence=%d "
+        "finite_query=%d finite_features=%d finite_latent=%d finite_residual=%d finite_stepper=%d finite_decompressor=%d finite_pose=%d "
+        "residual_norm_before=%.9g residual_norm_after=%.9g stepper_input_norm=%.9g stepper_output_norm=%.9g "
+        "decompressor_input_norm=%.9g root_planar_speed=%.9g contact_slip=%.9g correction_magnitude=%.9g "
+        "switch_severity=%.9g residual_carry_alpha=%.9g selector_margin=%.9g exemplar_dwell_frames=%d emergency_reanchor=%d hard_reset=%d\n",
+        snapshot.frame,
+        snapshot.teacher_frame,
+        snapshot.selected_exemplar,
+        snapshot.exemplar_valid ? 1 : 0,
+        snapshot.switch_flag ? 1 : 0,
+        snapshot.divergence_flag ? 1 : 0,
+        snapshot.finite_query ? 1 : 0,
+        snapshot.finite_features ? 1 : 0,
+        snapshot.finite_latent ? 1 : 0,
+        snapshot.finite_residual ? 1 : 0,
+        snapshot.finite_stepper ? 1 : 0,
+        snapshot.finite_decompressor ? 1 : 0,
+        snapshot.finite_pose ? 1 : 0,
+        snapshot.residual_norm_before,
+        snapshot.residual_norm_after,
+        snapshot.stepper_input_norm,
+        snapshot.stepper_output_norm,
+        snapshot.decompressor_input_norm,
+        snapshot.root_planar_speed,
+        snapshot.contact_slip,
+        snapshot.correction_magnitude,
+        snapshot.switch_severity,
+        snapshot.residual_carry_alpha,
+        snapshot.selector_margin,
+        snapshot.exemplar_dwell_frames,
+        snapshot.emergency_reanchor ? 1 : 0,
+        snapshot.hard_reset ? 1 : 0);
+
+    write_debug_vector_int(f, "topk_indices", snapshot.topk_indices);
+    write_debug_vector(f, "topk_costs", snapshot.topk_costs);
+    write_debug_vector(f, "selector_scores", snapshot.selector_scores);
+    write_debug_vector(f, "query_normalized", snapshot.query_normalized);
+    write_debug_vector(f, "features_curr", snapshot.features_curr);
+    write_debug_vector(f, "latent_curr", snapshot.latent_curr);
+    write_debug_vector(f, "residual_features", snapshot.residual_features);
+    write_debug_vector(f, "residual_latent", snapshot.residual_latent);
+    write_debug_vector(f, "stepper_control", snapshot.stepper_control);
+    fprintf(f, "---\n");
+}
+
+static bool load_eval_script(const char* filename, std::vector<eval_input_sample>& samples)
+{
+    FILE* f = fopen(filename, "r");
+    if (f == NULL)
+    {
+        return false;
+    }
+
+    samples.clear();
+    char line[256];
+    while (fgets(line, sizeof(line), f) != NULL)
+    {
+        if (line[0] == '#' || line[0] == '\n' || line[0] == '\r')
+        {
+            continue;
+        }
+
+        eval_input_sample sample;
+        int strafe = 0;
+        int parsed = sscanf(
+            line,
+            " %f %f %f %f %f %d",
+            &sample.left_x,
+            &sample.left_z,
+            &sample.right_x,
+            &sample.right_z,
+            &sample.gait,
+            &strafe);
+
+        if (parsed == 6)
+        {
+            sample.strafe = strafe != 0;
+            samples.push_back(sample);
+        }
+    }
+
+    fclose(f);
+    return !samples.empty();
+}
+
+static bool eval_parse_args(int argc, char** argv)
+{
+    for (int i = 1; i < argc; i++)
+    {
+        std::string arg = argv[i];
+        auto require_value = [&](const char* name) -> const char*
+        {
+            assert(i + 1 < argc);
+            i++;
+            return argv[i];
+        };
+
+        if (arg == "--eval-script")
+        {
+            g_eval_config.enabled = true;
+            g_eval_config.script_path = require_value("--eval-script");
+        }
+        else if (arg == "--eval-trace")
+        {
+            g_eval_config.trace_path = require_value("--eval-trace");
+        }
+        else if (arg == "--eval-tag")
+        {
+            g_eval_config.tag = require_value("--eval-tag");
+        }
+        else if (arg == "--eval-mode")
+        {
+            g_eval_config.enabled = true;
+            std::string value = require_value("--eval-mode");
+            g_eval_config.use_learned = value == "learned";
+        }
+        else if (arg == "--hybrid-selector-mode")
+        {
+            g_eval_config.selector_mode = require_value("--hybrid-selector-mode");
+        }
+        else if (arg == "--hybrid-residual-mode")
+        {
+            g_eval_config.residual_mode = require_value("--hybrid-residual-mode");
+        }
+        else if (arg == "--failure-dump-dir")
+        {
+            g_eval_config.failure_dump_dir = require_value("--failure-dump-dir");
+        }
+        else if (arg == "--eval-start-x")
+        {
+            g_eval_config.start_x = atof(require_value("--eval-start-x"));
+        }
+        else if (arg == "--eval-start-z")
+        {
+            g_eval_config.start_z = atof(require_value("--eval-start-z"));
+        }
+        else if (arg == "--eval-start-yaw")
+        {
+            g_eval_config.start_yaw = atof(require_value("--eval-start-yaw"));
+        }
+        else if (arg == "--eval-frames")
+        {
+            g_eval_config.frames = atoi(require_value("--eval-frames"));
+        }
+    }
+
+    if (!g_eval_config.enabled)
+    {
+        return true;
+    }
+
+    if (g_eval_config.script_path.empty() || g_eval_config.trace_path.empty() || g_eval_config.frames <= 0)
+    {
+        return false;
+    }
+
+    return load_eval_script(g_eval_config.script_path.c_str(), g_eval_script);
 }
 
 float environment_base_height(float x, float z)
@@ -294,7 +856,7 @@ float environment_obstacle_sdf(
     const float x,
     const float z,
     const slice1d<environment_box> environment_boxes,
-    const float clamp_distance = PFNN_OBSTACLE_SDF_CLAMP_DISTANCE)
+    const float clamp_distance = g_terrain_sampling_config.sdf_clamp_distance)
 {
     float sdf = clamp_distance;
     bool found_obstacle = false;
@@ -338,6 +900,20 @@ float environment_surface_height(
     }
 
     return height;
+}
+
+vec3 environment_surface_normal(
+    const float x,
+    const float z,
+    const slice1d<environment_box> environment_boxes,
+    const float eps = 0.05f)
+{
+    float hx0 = environment_surface_height(x - eps, z, environment_boxes);
+    float hx1 = environment_surface_height(x + eps, z, environment_boxes);
+    float hz0 = environment_surface_height(x, z - eps, environment_boxes);
+    float hz1 = environment_surface_height(x, z + eps, environment_boxes);
+    vec3 normal = normalize(vec3(-(hx1 - hx0), 2.0f * eps, -(hz1 - hz0)));
+    return length(normal) > 1e-5f ? normal : vec3(0.0f, 1.0f, 0.0f);
 }
 
 void terrain_mesh_apply_heightfield(Mesh& mesh, bool upload_to_gpu = false)
@@ -1011,9 +1587,13 @@ void query_compute_trajectory_position_feature(
     const quat root_rotation, 
     const slice1d<vec3> trajectory_positions)
 {
-    vec3 traj0 = quat_inv_mul_vec3(root_rotation, trajectory_positions(1) - root_position);
-    vec3 traj1 = quat_inv_mul_vec3(root_rotation, trajectory_positions(2) - root_position);
-    vec3 traj2 = quat_inv_mul_vec3(root_rotation, trajectory_positions(3) - root_position);
+    assert(g_terrain_sampling_config.matching_trajectory_horizons.size() == 3);
+    int idx0 = prediction_index_for_horizon(g_terrain_sampling_config.matching_trajectory_horizons[0]);
+    int idx1 = prediction_index_for_horizon(g_terrain_sampling_config.matching_trajectory_horizons[1]);
+    int idx2 = prediction_index_for_horizon(g_terrain_sampling_config.matching_trajectory_horizons[2]);
+    vec3 traj0 = quat_inv_mul_vec3(root_rotation, trajectory_positions(idx0) - root_position);
+    vec3 traj1 = quat_inv_mul_vec3(root_rotation, trajectory_positions(idx1) - root_position);
+    vec3 traj2 = quat_inv_mul_vec3(root_rotation, trajectory_positions(idx2) - root_position);
     
     query(offset + 0) = traj0.x;
     query(offset + 1) = traj0.z;
@@ -1032,9 +1612,13 @@ void query_compute_trajectory_direction_feature(
     const quat root_rotation, 
     const slice1d<quat> trajectory_rotations)
 {
-    vec3 traj0 = quat_inv_mul_vec3(root_rotation, quat_mul_vec3(trajectory_rotations(1), vec3(0, 0, 1)));
-    vec3 traj1 = quat_inv_mul_vec3(root_rotation, quat_mul_vec3(trajectory_rotations(2), vec3(0, 0, 1)));
-    vec3 traj2 = quat_inv_mul_vec3(root_rotation, quat_mul_vec3(trajectory_rotations(3), vec3(0, 0, 1)));
+    assert(g_terrain_sampling_config.matching_trajectory_horizons.size() == 3);
+    int idx0 = prediction_index_for_horizon(g_terrain_sampling_config.matching_trajectory_horizons[0]);
+    int idx1 = prediction_index_for_horizon(g_terrain_sampling_config.matching_trajectory_horizons[1]);
+    int idx2 = prediction_index_for_horizon(g_terrain_sampling_config.matching_trajectory_horizons[2]);
+    vec3 traj0 = quat_inv_mul_vec3(root_rotation, quat_mul_vec3(trajectory_rotations(idx0), vec3(0, 0, 1)));
+    vec3 traj1 = quat_inv_mul_vec3(root_rotation, quat_mul_vec3(trajectory_rotations(idx1), vec3(0, 0, 1)));
+    vec3 traj2 = quat_inv_mul_vec3(root_rotation, quat_mul_vec3(trajectory_rotations(idx2), vec3(0, 0, 1)));
     
     query(offset + 0) = traj0.x;
     query(offset + 1) = traj0.z;
@@ -1058,24 +1642,25 @@ void query_compute_environment_feature(
     const float root_ground_height = environment_base_height(root_position.x, root_position.z);
     int terrain_offset = offset;
 
-    for (int i = 1; i < trajectory_positions.size; i++)
+    for (int horizon : g_terrain_sampling_config.environment_horizons)
     {
-        vec3 center = trajectory_positions(i);
-        vec3 right = quat_mul_vec3(trajectory_rotations(i), vec3(1.0f, 0.0f, 0.0f));
+        int trajectory_index = prediction_index_for_horizon(horizon);
+        vec3 center = trajectory_positions(trajectory_index);
+        vec3 right = quat_mul_vec3(trajectory_rotations(trajectory_index), vec3(1.0f, 0.0f, 0.0f));
 
-        vec3 sample_right = center + PFNN_TERRAIN_STRIP_HALF_WIDTH * right;
-        vec3 sample_left = center - PFNN_TERRAIN_STRIP_HALF_WIDTH * right;
+        vec3 sample_right = center + g_terrain_sampling_config.strip_half_width * right;
+        vec3 sample_left = center - g_terrain_sampling_config.strip_half_width * right;
 
-        if (environment_feature_count >= PFNN_TERRAIN_FEATURE_COUNT)
+        if (environment_feature_count >= terrain_feature_count())
         {
             query(terrain_offset + 0) = environment_base_height(sample_right.x, sample_right.z) - root_ground_height;
             query(terrain_offset + 1) = environment_base_height(center.x, center.z) - root_ground_height;
             query(terrain_offset + 2) = environment_base_height(sample_left.x, sample_left.z) - root_ground_height;
         }
 
-        if (environment_feature_count >= PFNN_TERRAIN_FEATURE_COUNT + PFNN_OBSTACLE_SDF_FEATURE_COUNT)
+        if (environment_feature_count >= terrain_feature_count() + obstacle_sdf_feature_count())
         {
-            int sdf_offset = offset + PFNN_TERRAIN_FEATURE_COUNT + (i - 1) * 3;
+            int sdf_offset = offset + terrain_feature_count() + (terrain_offset - offset);
             query(sdf_offset + 0) = environment_obstacle_sdf(sample_right.x, sample_right.z, environment_boxes);
             query(sdf_offset + 1) = environment_obstacle_sdf(center.x, center.z, environment_boxes);
             query(sdf_offset + 2) = environment_obstacle_sdf(sample_left.x, sample_left.z, environment_boxes);
@@ -1084,7 +1669,7 @@ void query_compute_environment_feature(
         terrain_offset += 3;
     }
 
-    for (int i = PFNN_TERRAIN_FEATURE_COUNT + PFNN_OBSTACLE_SDF_FEATURE_COUNT; i < environment_feature_count; i++)
+    for (int i = terrain_feature_count() + obstacle_sdf_feature_count(); i < environment_feature_count; i++)
     {
         query(offset + i) = 0.0f;
     }
@@ -1357,6 +1942,31 @@ void contact_reset(
     contact_offset_velocity = vec3();
 }
 
+void contact_bootstrap(
+    bool& contact_state,
+    bool& contact_lock,
+    vec3& contact_position,
+    vec3& contact_velocity,
+    vec3& contact_point,
+    vec3& contact_target,
+    vec3& contact_offset_position,
+    vec3& contact_offset_velocity,
+    const vec3 input_contact_position,
+    const bool input_contact_state,
+    const float ground_height,
+    const float foot_height)
+{
+    contact_state = input_contact_state;
+    contact_lock = input_contact_state;
+    contact_position = input_contact_position;
+    contact_position.y = ground_height + foot_height;
+    contact_velocity = vec3();
+    contact_point = contact_position;
+    contact_target = input_contact_position;
+    contact_offset_position = vec3();
+    contact_offset_velocity = vec3();
+}
+
 void contact_update(
     bool& contact_state,
     bool& contact_lock,
@@ -1533,6 +2143,50 @@ void draw_axis(const vec3 pos, const quat rot, const float scale = 1.0f)
     DrawLine3D(to_Vector3(pos), to_Vector3(axis2), BLUE);
 }
 
+float bootstrap_support_root_offset(
+    const slice1d<vec3> bone_positions,
+    const slice1d<quat> bone_rotations,
+    const slice1d<bool> contact_states,
+    const slice1d<int> contact_bones,
+    const slice1d<int> bone_parents,
+    const slice1d<environment_box> environment_boxes,
+    const float foot_height)
+{
+    array1d<vec3> global_positions(bone_positions.size); global_positions.zero();
+    array1d<quat> global_rotations(bone_rotations.size); global_rotations.zero();
+    array1d<bool> global_computed(bone_positions.size); global_computed.set(false);
+
+    float offset_sum = 0.0f;
+    int active_contacts = 0;
+
+    for (int i = 0; i < contact_bones.size; i++)
+    {
+        if (!contact_states(i))
+        {
+            continue;
+        }
+
+        int toe_bone = contact_bones(i);
+        forward_kinematics_partial(
+            global_positions,
+            global_rotations,
+            global_computed,
+            bone_positions,
+            bone_rotations,
+            bone_parents,
+            toe_bone);
+
+        float ground_height = environment_surface_height(
+            global_positions(toe_bone).x,
+            global_positions(toe_bone).z,
+            environment_boxes);
+        offset_sum += (ground_height + foot_height) - global_positions(toe_bone).y;
+        active_contacts++;
+    }
+
+    return active_contacts > 0 ? offset_sum / active_contacts : 0.0f;
+}
+
 void draw_skeleton(
     const slice1d<vec3> global_bone_positions,
     const slice1d<int> bone_parents,
@@ -1584,7 +2238,7 @@ void draw_features(const slice1d<float> features, const vec3 pos, const quat rot
     DrawLine3D(to_Vector3(traj1_pos), to_Vector3(traj1_pos + 0.25f * traj1_dir), color);
     DrawLine3D(to_Vector3(traj2_pos), to_Vector3(traj2_pos + 0.25f * traj2_dir), color); 
 
-    if (features.size >= MOTION_MATCH_BASE_FEATURE_COUNT + PFNN_TERRAIN_FEATURE_COUNT)
+    if (features.size >= MOTION_MATCH_BASE_FEATURE_COUNT + terrain_feature_count())
     {
         float root_ground_height = environment_base_height(pos.x, pos.z);
         vec3 up = vec3(0.0f, 1.0f, 0.0f);
@@ -1594,9 +2248,9 @@ void draw_features(const slice1d<float> features, const vec3 pos, const quat rot
             vec3 dir = normalize(vec3(traj_dir.x, 0.0f, traj_dir.z) + vec3(1e-5f, 0.0f, 0.0f));
             vec3 right = normalize(cross(up, dir));
 
-            vec3 sample_right = traj_pos + PFNN_TERRAIN_STRIP_HALF_WIDTH * right;
+            vec3 sample_right = traj_pos + g_terrain_sampling_config.strip_half_width * right;
             vec3 sample_center = traj_pos;
-            vec3 sample_left = traj_pos - PFNN_TERRAIN_STRIP_HALF_WIDTH * right;
+            vec3 sample_left = traj_pos - g_terrain_sampling_config.strip_half_width * right;
 
             sample_right.y = root_ground_height + features(terrain_offset + 0);
             sample_center.y = root_ground_height + features(terrain_offset + 1);
@@ -1609,12 +2263,15 @@ void draw_features(const slice1d<float> features, const vec3 pos, const quat rot
             DrawLine3D(to_Vector3(sample_center), to_Vector3(sample_right), DARKGREEN);
         };
 
-        draw_terrain_strip(traj0_pos, traj0_dir, MOTION_MATCH_BASE_FEATURE_COUNT + 0);
-        draw_terrain_strip(traj1_pos, traj1_dir, MOTION_MATCH_BASE_FEATURE_COUNT + 3);
-        draw_terrain_strip(traj2_pos, traj2_dir, MOTION_MATCH_BASE_FEATURE_COUNT + 6);
+        int terrain_offset0 = environment_feature_offset_for_horizon(g_terrain_sampling_config.matching_trajectory_horizons[0]);
+        int terrain_offset1 = environment_feature_offset_for_horizon(g_terrain_sampling_config.matching_trajectory_horizons[1]);
+        int terrain_offset2 = environment_feature_offset_for_horizon(g_terrain_sampling_config.matching_trajectory_horizons[2]);
+        if (terrain_offset0 != -1) draw_terrain_strip(traj0_pos, traj0_dir, MOTION_MATCH_BASE_FEATURE_COUNT + terrain_offset0);
+        if (terrain_offset1 != -1) draw_terrain_strip(traj1_pos, traj1_dir, MOTION_MATCH_BASE_FEATURE_COUNT + terrain_offset1);
+        if (terrain_offset2 != -1) draw_terrain_strip(traj2_pos, traj2_dir, MOTION_MATCH_BASE_FEATURE_COUNT + terrain_offset2);
     }
 
-    if (features.size >= MOTION_MATCH_BASE_FEATURE_COUNT + PFNN_TERRAIN_FEATURE_COUNT + PFNN_OBSTACLE_SDF_FEATURE_COUNT)
+    if (features.size >= MOTION_MATCH_BASE_FEATURE_COUNT + terrain_feature_count() + obstacle_sdf_feature_count())
     {
         vec3 up = vec3(0.0f, 1.0f, 0.0f);
 
@@ -1624,15 +2281,15 @@ void draw_features(const slice1d<float> features, const vec3 pos, const quat rot
             vec3 right = normalize(cross(up, dir));
 
             vec3 samples[3] = {
-                traj_pos + PFNN_TERRAIN_STRIP_HALF_WIDTH * right,
+                traj_pos + g_terrain_sampling_config.strip_half_width * right,
                 traj_pos,
-                traj_pos - PFNN_TERRAIN_STRIP_HALF_WIDTH * right,
+                traj_pos - g_terrain_sampling_config.strip_half_width * right,
             };
 
             for (int i = 0; i < 3; i++)
             {
                 float sdf = features(sdf_offset + i);
-                float danger = sdf < 0.0f ? 1.0f : 1.0f - clampf(sdf / PFNN_OBSTACLE_SDF_CLAMP_DISTANCE, 0.0f, 1.0f);
+                float danger = sdf < 0.0f ? 1.0f : 1.0f - clampf(sdf / g_terrain_sampling_config.sdf_clamp_distance, 0.0f, 1.0f);
                 float radius = 0.05f + 0.12f * danger;
 
                 samples[i].y = environment_base_height(samples[i].x, samples[i].z) + 0.03f;
@@ -1645,9 +2302,12 @@ void draw_features(const slice1d<float> features, const vec3 pos, const quat rot
             }
         };
 
-        draw_sdf_strip(traj0_pos, traj0_dir, MOTION_MATCH_BASE_FEATURE_COUNT + PFNN_TERRAIN_FEATURE_COUNT + 0);
-        draw_sdf_strip(traj1_pos, traj1_dir, MOTION_MATCH_BASE_FEATURE_COUNT + PFNN_TERRAIN_FEATURE_COUNT + 3);
-        draw_sdf_strip(traj2_pos, traj2_dir, MOTION_MATCH_BASE_FEATURE_COUNT + PFNN_TERRAIN_FEATURE_COUNT + 6);
+        int terrain_offset0 = environment_feature_offset_for_horizon(g_terrain_sampling_config.matching_trajectory_horizons[0]);
+        int terrain_offset1 = environment_feature_offset_for_horizon(g_terrain_sampling_config.matching_trajectory_horizons[1]);
+        int terrain_offset2 = environment_feature_offset_for_horizon(g_terrain_sampling_config.matching_trajectory_horizons[2]);
+        if (terrain_offset0 != -1) draw_sdf_strip(traj0_pos, traj0_dir, MOTION_MATCH_BASE_FEATURE_COUNT + terrain_feature_count() + terrain_offset0);
+        if (terrain_offset1 != -1) draw_sdf_strip(traj1_pos, traj1_dir, MOTION_MATCH_BASE_FEATURE_COUNT + terrain_feature_count() + terrain_offset1);
+        if (terrain_offset2 != -1) draw_sdf_strip(traj2_pos, traj2_dir, MOTION_MATCH_BASE_FEATURE_COUNT + terrain_feature_count() + terrain_offset2);
     }
 }
 
@@ -1854,13 +2514,31 @@ void update_callback(void* args)
     ((std::function<void()>*)args)->operator()();
 }
 
-int main(void)
+int main(int argc, char** argv)
 {
+    if (!eval_parse_args(argc, argv))
+    {
+        fprintf(stderr, "invalid eval arguments\n");
+        return 1;
+    }
+    if (g_eval_config.selector_mode != "teacher" && g_eval_config.selector_mode != "learned")
+    {
+        g_eval_config.selector_mode = "learned";
+    }
+    if (g_eval_config.residual_mode != "teacher" && g_eval_config.residual_mode != "learned" && g_eval_config.residual_mode != "zero")
+    {
+        g_eval_config.residual_mode = "learned";
+    }
+
     // Init Window
     
     const int screen_width = 1280;
     const int screen_height = 720;
     
+    if (g_eval_config.enabled)
+    {
+        SetConfigFlags(FLAG_WINDOW_HIDDEN);
+    }
     SetConfigFlags(FLAG_VSYNC_HINT);
     SetConfigFlags(FLAG_MSAA_4X_HINT);
     InitWindow(screen_width, screen_height, "raylib [data vs code driven displacement]");
@@ -1884,6 +2562,7 @@ int main(void)
     bool debug_draw_bind_skeleton = false;
     bool debug_draw_bind_mesh = false;
 
+    load_terrain_sampling_config(PFNN_TERRAIN_CONFIG_FILENAME);
     load_environment_heightmap();
     
     // Scene Obstacles
@@ -1892,10 +2571,8 @@ int main(void)
     initialize_environment_boxes(environment_boxes);
 
     // Ground Plane
-    
-    Shader ground_plane_shader = LoadShader(
-        CHECKERBOARD_VERTEX_SHADER_FILENAME,
-        CHECKERBOARD_FRAGMENT_SHADER_FILENAME);
+
+    Shader ground_plane_shader = { 0 };
     float terrain_span_x = g_environment_heightmap.loaded() ? (g_environment_heightmap.x_max - g_environment_heightmap.x_min) : 28.0f;
     float terrain_span_z = g_environment_heightmap.loaded() ? (g_environment_heightmap.z_max - g_environment_heightmap.z_min) : 28.0f;
     int terrain_slices_x = g_environment_heightmap.loaded() ? (g_environment_heightmap.width > 2 ? g_environment_heightmap.width - 1 : 2) : 80;
@@ -1903,30 +2580,46 @@ int main(void)
     float terrain_center_x = g_environment_heightmap.loaded() ? 0.5f * (g_environment_heightmap.x_min + g_environment_heightmap.x_max) : 0.0f;
     float terrain_center_z = g_environment_heightmap.loaded() ? 0.5f * (g_environment_heightmap.z_min + g_environment_heightmap.z_max) : 0.0f;
 
-    Mesh ground_plane_mesh = GenMeshPlane(terrain_span_x, terrain_span_z, terrain_slices_x, terrain_slices_z);
-    terrain_mesh_offset_xz(ground_plane_mesh, terrain_center_x, terrain_center_z);
-    terrain_mesh_apply_heightfield(ground_plane_mesh);
-    Model ground_plane_model = LoadModelFromMesh(ground_plane_mesh);
-    ground_plane_model.materials[0].shader = ground_plane_shader;
+    Mesh ground_plane_mesh = { 0 };
+    Model ground_plane_model = { 0 };
 
     auto rebuild_environment_scene = [&]()
     {
-        terrain_mesh_apply_heightfield(ground_plane_mesh, true);
+        if (!g_eval_config.enabled)
+        {
+            terrain_mesh_apply_heightfield(ground_plane_mesh, true);
+        }
     };
 
-    rebuild_environment_scene();
+    if (!g_eval_config.enabled)
+    {
+        ground_plane_shader = LoadShader(
+            CHECKERBOARD_VERTEX_SHADER_FILENAME,
+            CHECKERBOARD_FRAGMENT_SHADER_FILENAME);
+        ground_plane_mesh = GenMeshPlane(terrain_span_x, terrain_span_z, terrain_slices_x, terrain_slices_z);
+        terrain_mesh_offset_xz(ground_plane_mesh, terrain_center_x, terrain_center_z);
+        terrain_mesh_apply_heightfield(ground_plane_mesh);
+        ground_plane_model = LoadModelFromMesh(ground_plane_mesh);
+        ground_plane_model.materials[0].shader = ground_plane_shader;
+        rebuild_environment_scene();
+    }
     
     // Character
     
     character character_data;
-    character_load(character_data, "./resources/character.bin");
-    
-    Shader character_shader = LoadShader(
-        CHARACTER_VERTEX_SHADER_FILENAME,
-        CHARACTER_FRAGMENT_SHADER_FILENAME);
-    Mesh character_mesh = make_character_mesh(character_data);
-    Model character_model = LoadModelFromMesh(character_mesh);
-    character_model.materials[0].shader = character_shader;
+    Shader character_shader = { 0 };
+    Mesh character_mesh = { 0 };
+    Model character_model = { 0 };
+    if (!g_eval_config.enabled)
+    {
+        character_load(character_data, "./resources/character.bin");
+        character_shader = LoadShader(
+            CHARACTER_VERTEX_SHADER_FILENAME,
+            CHARACTER_FRAGMENT_SHADER_FILENAME);
+        character_mesh = make_character_mesh(character_data);
+        character_model = LoadModelFromMesh(character_mesh);
+        character_model.materials[0].shader = character_shader;
+    }
     
     // Load Animation Data and build Matching Database
     
@@ -2068,14 +2761,15 @@ int main(void)
     bool simulation_follow_animation_speed = true;
     float lmm_projector_transition_threshold = 0.10f;
     float lmm_projector_blend_halflife = 0.06f;
+    float trajectory_prediction_dt = g_terrain_sampling_config.prediction_frame_step * (1.0f / 60.0f);
     
-    array1d<vec3> trajectory_desired_velocities(4);
-    array1d<quat> trajectory_desired_rotations(4);
-    array1d<vec3> trajectory_positions(4);
-    array1d<vec3> trajectory_velocities(4);
-    array1d<vec3> trajectory_accelerations(4);
-    array1d<quat> trajectory_rotations(4);
-    array1d<vec3> trajectory_angular_velocities(4);
+    array1d<vec3> trajectory_desired_velocities(prediction_sample_count());
+    array1d<quat> trajectory_desired_rotations(prediction_sample_count());
+    array1d<vec3> trajectory_positions(prediction_sample_count());
+    array1d<vec3> trajectory_velocities(prediction_sample_count());
+    array1d<vec3> trajectory_accelerations(prediction_sample_count());
+    array1d<quat> trajectory_rotations(prediction_sample_count());
+    array1d<vec3> trajectory_angular_velocities(prediction_sample_count());
     
     // Synchronization
     
@@ -2160,44 +2854,118 @@ int main(void)
     // Learned Motion Matching
     
     bool lmm_enabled = false;
-    
-    nnet decompressor, stepper, projector;    
-    nnet_load(decompressor, "./resources/decompressor.bin");
-    nnet_load(stepper, "./resources/stepper.bin");
-    nnet_load(projector, "./resources/projector.bin");
+    const int hybrid_topk = 8;
 
-    nnet_evaluation decompressor_evaluation, stepper_evaluation, projector_evaluation;
-    decompressor_evaluation.resize(decompressor);
-    stepper_evaluation.resize(stepper);
-    projector_evaluation.resize(projector);
-    bool lmm_networks_compatible =
-        decompressor.input_mean.size == db.nfeatures() + 32 &&
-        stepper.input_mean.size == db.nfeatures() + 32 &&
-        projector.input_mean.size == db.nfeatures();
+    nnet decompressor, selector, residual_stepper;
+    array2d<float> latent_database;
+    bool hybrid_assets_available =
+        file_exists("./resources/decompressor.bin") &&
+        file_exists("./resources/selector.bin") &&
+        file_exists("./resources/residual_stepper.bin") &&
+        file_exists("./resources/latent.bin");
+
+    bool lmm_networks_compatible = false;
+    nnet_evaluation decompressor_evaluation, selector_evaluation, residual_stepper_evaluation;
+
+    if (hybrid_assets_available)
+    {
+        nnet_load(decompressor, "./resources/decompressor.bin");
+        nnet_load(selector, "./resources/selector.bin");
+        nnet_load(residual_stepper, "./resources/residual_stepper.bin");
+        latent_load(latent_database, "./resources/latent.bin");
+
+        decompressor_evaluation.resize(decompressor);
+        selector_evaluation.resize(selector);
+        residual_stepper_evaluation.resize(residual_stepper);
+
+        lmm_networks_compatible =
+            decompressor.input_mean.size == db.nfeatures() + 32 &&
+            selector.input_mean.size == db.nfeatures() * 3 + 1 &&
+            residual_stepper.input_mean.size == db.nfeatures() + 32 + control_feature_count(db.nfeatures()) + db.nfeatures() + 32 &&
+            residual_stepper.output_mean.size == db.nfeatures() + 32 &&
+            latent_database.rows == db.nframes() &&
+            latent_database.cols == 32;
+    }
+
     lmm_enabled = lmm_networks_compatible;
 
-    array1d<float> features_proj = db.features(frame_index);
     array1d<float> features_curr = db.features(frame_index);
-    array1d<float> latent_proj(32); latent_proj.zero();
     array1d<float> latent_curr(32); latent_curr.zero();
+    array1d<float> residual_features(db.nfeatures()); residual_features.zero();
+    array1d<float> residual_latent(32); residual_latent.zero();
+    array1d<int> topk_indices(hybrid_topk); topk_indices.set(-1);
+    array1d<float> topk_costs(hybrid_topk); topk_costs.set(FLT_MAX);
+    array1d<float> selector_scores(hybrid_topk); selector_scores.set(-FLT_MAX);
+    int exemplar_index = -1;
+    array1d<float> stepper_control(control_feature_count(db.nfeatures())); stepper_control.zero();
     array1d<float> debug_query_features = db.features(frame_index);
     denormalize_features(debug_query_features, db.features_offset, db.features_scale);
+
+    if (lmm_networks_compatible)
+    {
+        for (int i = 0; i < latent_curr.size; i++)
+        {
+            latent_curr(i) = latent_database(frame_index, i);
+        }
+    }
+
+    FILE* eval_trace = NULL;
+    int eval_frame_index = 0;
+    bool eval_complete = false;
+    int teacher_frame_index = frame_index;
+    bool debug_teacher_selector = g_eval_config.selector_mode == "teacher";
+    bool debug_learned_selector = g_eval_config.selector_mode == "learned";
+    bool debug_teacher_residual = g_eval_config.residual_mode == "teacher";
+    bool debug_learned_residual = g_eval_config.residual_mode == "learned";
+    bool debug_zero_residual = g_eval_config.residual_mode == "zero";
+    std::vector<runtime_debug_snapshot> failure_history;
+    std::vector<runtime_debug_snapshot> failure_future;
+    bool failure_triggered = false;
+    bool failure_dump_written = false;
+    int failure_future_remaining = 0;
+    array1d<vec3> eval_prev_contact_positions(contact_bones.size);
+    array1d<bool> eval_prev_contact_valid(contact_bones.size);
+    eval_prev_contact_positions.zero();
+    eval_prev_contact_valid.set(false);
+    int exemplar_dwell_frames = 1000000;
+    float runtime_prev_contact_slip = 0.0f;
+    float runtime_prev_contact_height_error = 0.0f;
+    int runtime_prev_terrain_penetrations = 0;
+    bool runtime_emergency_reanchor = false;
     
     // Go
 
     float dt = 1.0f / 60.0f;
 
-    simulation_position = vec3(0.0f, environment_surface_height(0.0f, 0.0f, environment_boxes), 0.0f);
+    simulation_position = vec3(g_eval_config.start_x, environment_surface_height(g_eval_config.start_x, g_eval_config.start_z, environment_boxes), g_eval_config.start_z);
     simulation_velocity = vec3();
     simulation_acceleration = vec3();
-    simulation_rotation = quat();
+    simulation_rotation = quat_from_angle_axis(g_eval_config.start_yaw, vec3(0.0f, 1.0f, 0.0f));
     simulation_angular_velocity = vec3();
     desired_velocity = vec3();
     desired_velocity_change_curr = vec3();
     desired_velocity_change_prev = vec3();
-    desired_rotation = quat();
+    desired_rotation = simulation_rotation;
     desired_rotation_change_curr = vec3();
     desired_rotation_change_prev = vec3();
+    lmm_enabled = g_eval_config.enabled ? (g_eval_config.use_learned && lmm_networks_compatible) : lmm_enabled;
+    if (g_eval_config.enabled)
+    {
+        terrain_preview_enabled = false;
+        debug_draw_mesh = false;
+        debug_draw_skeleton = false;
+        debug_draw_bind_skeleton = false;
+        debug_draw_bind_mesh = false;
+        eval_trace = fopen(g_eval_config.trace_path.c_str(), "w");
+        assert(eval_trace != NULL);
+            fprintf(
+                eval_trace,
+                "frame,time,root_x,root_y,root_z,teacher_frame,selected_exemplar,exemplar_valid,switch_flag,divergence_flag,"
+                "residual_norm_before,residual_norm_after,stepper_input_norm,stepper_output_norm,decompressor_input_norm,"
+                "root_planar_speed,contact_height_error,contact_slip,terrain_penetrations,correction_magnitude,stepper_drift,"
+                "switch_severity,residual_carry_alpha,selector_margin,exemplar_dwell_frames,emergency_reanchor,hard_reset,"
+                "finite_query,finite_features,finite_latent,finite_residual,finite_stepper,finite_decompressor,finite_pose,mode,selector_mode,residual_mode\n");
+    }
 
     auto update_func = [&]()
     {
@@ -2226,18 +2994,32 @@ int main(void)
             ik_enabled = !ik_enabled;
         }
       
+        eval_input_sample eval_input;
+        if (g_eval_config.enabled)
+        {
+            eval_input = g_eval_script[std::min(eval_frame_index, (int)g_eval_script.size() - 1)];
+        }
+
         // Get gamepad stick states
-        vec3 gamepadstick_left = gamepad_get_stick(GAMEPAD_STICK_LEFT);
-        vec3 gamepadstick_right = gamepad_get_stick(GAMEPAD_STICK_RIGHT);
+        vec3 gamepadstick_left = g_eval_config.enabled ? vec3(eval_input.left_x, 0.0f, eval_input.left_z) : gamepad_get_stick(GAMEPAD_STICK_LEFT);
+        vec3 gamepadstick_right = g_eval_config.enabled ? vec3(eval_input.right_x, 0.0f, eval_input.right_z) : gamepad_get_stick(GAMEPAD_STICK_RIGHT);
         
         // Get if strafe is desired
-        bool desired_strafe = desired_strafe_update();
+        bool desired_strafe = g_eval_config.enabled ? eval_input.strafe : desired_strafe_update();
         
         // Get the desired gait (walk / run)
-        desired_gait_update(
-            desired_gait,
-            desired_gait_velocity,
-            dt);
+        if (g_eval_config.enabled)
+        {
+            desired_gait = eval_input.gait;
+            desired_gait_velocity = 0.0f;
+        }
+        else
+        {
+            desired_gait_update(
+                desired_gait,
+                desired_gait_velocity,
+                dt);
+        }
         
         // Get the desired query/request speeds based on the gait
         float simulation_fwrd_speed = 0.0f;
@@ -2309,7 +3091,7 @@ int main(void)
           gamepadstick_left,
           gamepadstick_right,
           desired_strafe,
-          20.0f * dt);
+          trajectory_prediction_dt);
         
         trajectory_rotations_predict(
             trajectory_rotations,
@@ -2318,7 +3100,7 @@ int main(void)
             simulation_angular_velocity,
             trajectory_desired_rotations,
             simulation_rotation_halflife,
-            20.0f * dt);
+            trajectory_prediction_dt);
         
         trajectory_desired_velocities_predict(
           trajectory_desired_velocities,
@@ -2331,7 +3113,7 @@ int main(void)
           simulation_fwrd_speed,
           simulation_side_speed,
           simulation_back_speed,
-          20.0f * dt);
+          trajectory_prediction_dt);
         
         trajectory_positions_predict(
             trajectory_positions,
@@ -2342,7 +3124,7 @@ int main(void)
             simulation_acceleration,
             trajectory_desired_velocities,
             simulation_velocity_halflife,
-            20.0f * dt,
+            trajectory_prediction_dt,
             environment_boxes);
            
         // Make query vector for search.
@@ -2363,6 +3145,13 @@ int main(void)
         query_copy_denormalized_feature(query, offset, 3, query_features, db.features_offset, db.features_scale); // Hip Velocity
         query_compute_trajectory_position_feature(query, offset, bone_positions(0), bone_rotations(0), trajectory_positions);
         query_compute_trajectory_direction_feature(query, offset, bone_rotations(0), trajectory_rotations);
+        query_copy_denormalized_feature(
+            query,
+            offset,
+            MOTION_MATCH_PHASE_CONTACT_FEATURE_COUNT,
+            query_features,
+            db.features_offset,
+            db.features_scale); // Phase sin/cos + contact state
         if (offset < db.nfeatures())
         {
             query_compute_environment_feature(
@@ -2377,35 +3166,309 @@ int main(void)
         
         assert(offset == db.nfeatures());
         debug_query_features = query;
+        stepper_control.zero();
+
+        array1d<float> query_normalized(db.nfeatures());
+        for (int i = 0; i < db.nfeatures(); i++)
+        {
+            float feature_scale = fabsf(db.features_scale(i)) > 1e-8f ? db.features_scale(i) : 1.0f;
+            query_normalized(i) = (query(i) - db.features_offset(i)) / feature_scale;
+        }
+        float projector_correction_mag = 0.0f;
+        float stepper_drift_mag = 0.0f;
+        float residual_norm_before = 0.0f;
+        float residual_norm_after = 0.0f;
+        float stepper_input_norm = 0.0f;
+        float stepper_output_norm = 0.0f;
+        float decompressor_input_norm = 0.0f;
+        bool switch_flag = false;
+        float switch_severity = 0.0f;
+        float residual_carry_alpha = 1.0f;
+        float selector_margin = 0.0f;
+        bool emergency_reanchor = runtime_emergency_reanchor;
+        bool hard_reset = false;
+        bool exemplar_valid = exemplar_index >= 0 && exemplar_index < db.nframes() &&
+            (db.searchable_frames.size != db.nframes() || db.searchable_frames(exemplar_index));
 
         // Check if we reached the end of the current anim
-        bool end_of_anim = database_trajectory_index_clamp(db, frame_index, 1) == frame_index;
+        bool end_of_anim = database_advance_frame(db, frame_index) == frame_index;
         
         bool lmm_reproject_enabled = lmm_enabled && lmm_networks_compatible;
 
-        // Do we need to search?
         if (lmm_reproject_enabled)
         {
-            float best_cost = FLT_MAX;
-            bool transition = false;
-
-            projector_evaluate(
-                transition,
-                best_cost,
-                features_proj,
-                latent_proj,
-                projector_evaluation,
-                query,
-                db.features_offset,
-                db.features_scale,
-                features_curr,
-                projector,
-                lmm_projector_transition_threshold);
-
-            if (transition)
+            search_timer -= dt;
+            int teacher_next_frame = teacher_frame_index;
+            int exemplar_next_frame = exemplar_index;
+            bool teacher_end_of_anim = database_advance_frame(db, teacher_frame_index) == teacher_frame_index;
+            bool exemplar_end_of_anim = true;
+            if (exemplar_index >= 0)
             {
-                damp_array_exact(features_curr, features_proj, lmm_projector_blend_halflife, dt);
-                damp_array_exact(latent_curr, latent_proj, lmm_projector_blend_halflife, dt);
+                exemplar_next_frame = database_advance_frame(db, exemplar_index);
+                exemplar_end_of_anim = exemplar_next_frame == exemplar_index;
+            }
+            bool do_search =
+                search_timer <= 0.0f ||
+                force_search ||
+                emergency_reanchor ||
+                exemplar_index == -1 ||
+                teacher_end_of_anim ||
+                exemplar_end_of_anim;
+
+            if (do_search)
+            {
+                database_search_topk(
+                    topk_indices,
+                    topk_costs,
+                    db,
+                    query,
+                    exemplar_index,
+                    motion_matching_transition_cost);
+
+                selector_scores.set(-FLT_MAX);
+                int selected_index = exemplar_index;
+                teacher_next_frame = topk_indices(0) >= 0 ? topk_indices(0) : teacher_frame_index;
+                float best_score = -FLT_MAX;
+                float current_score = -FLT_MAX;
+                bool current_in_topk = false;
+
+                if (debug_teacher_selector)
+                {
+                    selected_index = teacher_next_frame;
+                }
+                else
+                {
+                    for (int k = 0; k < topk_indices.size; k++)
+                    {
+                        if (topk_indices(k) < 0)
+                        {
+                            continue;
+                        }
+
+                        float score = selector_score_candidate(
+                            selector_evaluation,
+                            query_normalized,
+                            query_normalized,
+                            db.features(topk_indices(k)),
+                            topk_costs(k),
+                            selector);
+                        selector_scores(k) = score;
+
+                        if (score > best_score)
+                        {
+                            best_score = score;
+                            selected_index = topk_indices(k);
+                        }
+
+                        if (topk_indices(k) == exemplar_index)
+                        {
+                            current_score = score;
+                            current_in_topk = true;
+                        }
+                    }
+                }
+
+                if (!debug_teacher_selector &&
+                    selected_index != exemplar_index &&
+                    exemplar_index >= 0 &&
+                    exemplar_valid &&
+                    current_in_topk)
+                {
+                    selector_margin = HYBRID_SELECTOR_SCORE_MARGIN;
+                    bool dwell_locked = exemplar_dwell_frames < HYBRID_SELECTOR_MIN_DWELL_FRAMES;
+                    if (!emergency_reanchor &&
+                        best_score < current_score + selector_margin &&
+                        dwell_locked)
+                    {
+                        selected_index = exemplar_index;
+                    }
+                }
+
+                if (selected_index != -1)
+                {
+                    residual_norm_before = hybrid_residual_norm(residual_features, residual_latent);
+                    for (int i = 0; i < features_curr.size; i++)
+                    {
+                        projector_correction_mag += squaref(db.features(selected_index, i) - features_curr(i));
+                    }
+                    projector_correction_mag = sqrtf(projector_correction_mag / maxf((float)features_curr.size, 1.0f));
+
+                    switch_flag = selected_index != exemplar_index;
+                    exemplar_index = selected_index;
+                    exemplar_valid = db.searchable_frames.size != db.nframes() || db.searchable_frames(exemplar_index);
+                    switch_severity = hybrid_switch_severity(
+                        features_curr,
+                        db.features(exemplar_index),
+                        curr_bone_contacts,
+                        db.contact_states(exemplar_index));
+
+                    if (debug_teacher_residual)
+                    {
+                        teacher_frame_index = teacher_next_frame;
+                        features_curr = db.features(teacher_frame_index);
+                        for (int i = 0; i < latent_curr.size; i++)
+                        {
+                            latent_curr(i) = latent_database(teacher_frame_index, i);
+                        }
+                        for (int i = 0; i < residual_features.size; i++)
+                        {
+                            residual_features(i) = features_curr(i) - db.features(exemplar_index, i);
+                        }
+                        for (int i = 0; i < residual_latent.size; i++)
+                        {
+                            residual_latent(i) = latent_curr(i) - latent_database(exemplar_index, i);
+                        }
+                    }
+                    else if (debug_zero_residual)
+                    {
+                        residual_features.zero();
+                        residual_latent.zero();
+                        features_curr = db.features(exemplar_index);
+                        for (int i = 0; i < latent_curr.size; i++)
+                        {
+                            latent_curr(i) = latent_database(exemplar_index, i);
+                        }
+                        teacher_frame_index = teacher_next_frame;
+                    }
+                    else
+                    {
+                        teacher_frame_index = teacher_next_frame;
+                        for (int i = 0; i < residual_features.size; i++)
+                        {
+                            residual_features(i) = features_curr(i) - db.features(exemplar_index, i);
+                        }
+                        for (int i = 0; i < residual_latent.size; i++)
+                        {
+                            residual_latent(i) = latent_curr(i) - latent_database(exemplar_index, i);
+                        }
+
+                        bool contact_mode_changed =
+                            contact_state_mismatch(curr_bone_contacts, db.contact_states(exemplar_index)) > 0.5f;
+                        if (emergency_reanchor ||
+                            runtime_prev_contact_slip > HYBRID_CONTACT_SLIP_HARD_RESET ||
+                            runtime_prev_terrain_penetrations > 0 ||
+                            residual_norm_before > HYBRID_RESIDUAL_NORM_MAX * 0.9f ||
+                            switch_severity >= HYBRID_SWITCH_HARD_SEVERITY ||
+                            contact_mode_changed)
+                        {
+                            residual_carry_alpha = 0.0f;
+                            hard_reset = true;
+                        }
+                        else if (switch_severity >= HYBRID_SWITCH_MEDIUM_SEVERITY ||
+                                 runtime_prev_contact_slip > HYBRID_CONTACT_SLIP_GUARD ||
+                                 residual_norm_before > HYBRID_RESIDUAL_NORM_P99 * 2.0f)
+                        {
+                            residual_carry_alpha = HYBRID_CARRY_ALPHA_MEDIUM;
+                        }
+                        else if (switch_severity >= HYBRID_SWITCH_SOFT_SEVERITY ||
+                                 residual_norm_before > HYBRID_RESIDUAL_NORM_P99)
+                        {
+                            residual_carry_alpha = HYBRID_CARRY_ALPHA_SOFT;
+                        }
+
+                        for (int i = 0; i < residual_features.size; i++)
+                        {
+                            residual_features(i) *= residual_carry_alpha;
+                        }
+                        for (int i = 0; i < residual_latent.size; i++)
+                        {
+                            residual_latent(i) *= residual_carry_alpha;
+                        }
+                        hybrid_reconstruct_absolute_state(
+                            features_curr,
+                            latent_curr,
+                            db.features(exemplar_index),
+                            latent_database(exemplar_index),
+                            residual_features,
+                            residual_latent);
+                    }
+
+                    residual_norm_after = hybrid_residual_norm(residual_features, residual_latent);
+                }
+
+                runtime_emergency_reanchor = false;
+                search_timer = search_time;
+            }
+            else if (exemplar_index >= 0 && !debug_teacher_residual)
+            {
+                exemplar_index = exemplar_next_frame;
+                exemplar_valid =
+                    db.searchable_frames.size != db.nframes() ||
+                    db.searchable_frames(exemplar_index);
+
+                if (debug_zero_residual)
+                {
+                    residual_features.zero();
+                    residual_latent.zero();
+                    features_curr = db.features(exemplar_index);
+                    for (int i = 0; i < latent_curr.size; i++)
+                    {
+                        latent_curr(i) = latent_database(exemplar_index, i);
+                    }
+                }
+                else
+                {
+                    for (int i = 0; i < residual_features.size; i++)
+                    {
+                        residual_features(i) = features_curr(i) - db.features(exemplar_index, i);
+                    }
+                    for (int i = 0; i < residual_latent.size; i++)
+                    {
+                        residual_latent(i) = latent_curr(i) - latent_database(exemplar_index, i);
+                    }
+
+                    residual_norm_before = hybrid_residual_norm(residual_features, residual_latent);
+                    if (runtime_prev_contact_slip > HYBRID_CONTACT_SLIP_HARD_RESET ||
+                        runtime_prev_terrain_penetrations > 0 ||
+                        residual_norm_before > HYBRID_RESIDUAL_NORM_MAX * 0.9f)
+                    {
+                        residual_carry_alpha = 0.0f;
+                        hard_reset = true;
+                    }
+                    else if (runtime_prev_contact_slip > HYBRID_CONTACT_SLIP_GUARD ||
+                             residual_norm_before > HYBRID_RESIDUAL_NORM_P99 * 2.0f)
+                    {
+                        residual_carry_alpha = HYBRID_CARRY_ALPHA_MEDIUM;
+                    }
+                    else if (residual_norm_before > HYBRID_RESIDUAL_NORM_P99)
+                    {
+                        residual_carry_alpha = HYBRID_CARRY_ALPHA_SOFT;
+                    }
+
+                    for (int i = 0; i < residual_features.size; i++)
+                    {
+                        residual_features(i) *= residual_carry_alpha;
+                    }
+                    for (int i = 0; i < residual_latent.size; i++)
+                    {
+                        residual_latent(i) *= residual_carry_alpha;
+                    }
+                    hybrid_reconstruct_absolute_state(
+                        features_curr,
+                        latent_curr,
+                        db.features(exemplar_index),
+                        latent_database(exemplar_index),
+                        residual_features,
+                        residual_latent);
+                    residual_norm_after = hybrid_residual_norm(residual_features, residual_latent);
+                }
+            }
+            else if (debug_teacher_residual)
+            {
+                teacher_frame_index = database_advance_frame(db, teacher_frame_index);
+                features_curr = db.features(teacher_frame_index);
+                for (int i = 0; i < latent_curr.size; i++)
+                {
+                    latent_curr(i) = latent_database(teacher_frame_index, i);
+                }
+                for (int i = 0; i < residual_features.size; i++)
+                {
+                    residual_features(i) = features_curr(i) - db.features(exemplar_index, i);
+                }
+                for (int i = 0; i < residual_latent.size; i++)
+                {
+                    residual_latent(i) = latent_curr(i) - latent_database(exemplar_index, i);
+                }
             }
         }
         else
@@ -2458,15 +3521,101 @@ int main(void)
 
         }
 
+        if (lmm_reproject_enabled)
+        {
+            exemplar_dwell_frames = switch_flag ? 0 : exemplar_dwell_frames + 1;
+        }
+
+        slice1d<float> drift_features = lmm_enabled && lmm_networks_compatible ? slice1d<float>(features_curr) : db.features(frame_index);
+        for (int i = 0; i < drift_features.size; i++)
+        {
+            stepper_drift_mag += squaref(query_normalized(i) - drift_features(i));
+        }
+        stepper_drift_mag = sqrtf(stepper_drift_mag / maxf((float)drift_features.size, 1.0f));
+
         if (lmm_enabled && lmm_networks_compatible)
         {
-            // Update features and latents
-            stepper_evaluate(
-                features_curr,
-                latent_curr,
-                stepper_evaluation,
-                stepper,
-                dt);
+            for (int i = 0; i < stepper_control.size; i++)
+            {
+                stepper_control(i) = features_curr(15 + i);
+            }
+
+            array1d<float> anchor_latent(32);
+            for (int i = 0; i < anchor_latent.size; i++)
+            {
+                anchor_latent(i) = latent_database(exemplar_index, i);
+            }
+
+            if (debug_learned_residual)
+            {
+                array1d<float> residual_features_prev = residual_features;
+                array1d<float> residual_latent_prev = residual_latent;
+                stepper_input_norm = sqrtf(
+                    squaref(array_norm(residual_features)) +
+                    squaref(array_norm(residual_latent)) +
+                    squaref(array_norm(stepper_control)) +
+                    squaref(array_norm(db.features(exemplar_index))) +
+                    squaref(array_norm(anchor_latent)));
+
+                if (stepper_input_norm > HYBRID_STEPPER_INPUT_NORM_MAX ||
+                    hybrid_residual_norm(residual_features, residual_latent) > HYBRID_RESIDUAL_NORM_MAX)
+                {
+                    residual_features.zero();
+                    residual_latent.zero();
+                    hard_reset = true;
+                    emergency_reanchor = true;
+                    runtime_emergency_reanchor = true;
+                    hybrid_reconstruct_absolute_state(
+                        features_curr,
+                        latent_curr,
+                        db.features(exemplar_index),
+                        anchor_latent,
+                        residual_features,
+                        residual_latent);
+                    stepper_input_norm = 0.0f;
+                    stepper_output_norm = 0.0f;
+                }
+                else
+                {
+                    residual_stepper_evaluate(
+                        residual_features,
+                        residual_latent,
+                        stepper_control,
+                        db.features(exemplar_index),
+                        anchor_latent,
+                        residual_stepper_evaluation,
+                        residual_stepper,
+                        dt);
+
+                    float diff_total = 0.0f;
+                    for (int i = 0; i < residual_features.size; i++)
+                    {
+                        diff_total += squaref(residual_features(i) - residual_features_prev(i));
+                    }
+                    for (int i = 0; i < residual_latent.size; i++)
+                    {
+                        diff_total += squaref(residual_latent(i) - residual_latent_prev(i));
+                    }
+                    stepper_output_norm = sqrtf(diff_total);
+                }
+            }
+            else if (debug_zero_residual)
+            {
+                stepper_input_norm = 0.0f;
+                stepper_output_norm = 0.0f;
+                residual_features.zero();
+                residual_latent.zero();
+            }
+
+            for (int i = 0; i < features_curr.size; i++)
+            {
+                features_curr(i) = db.features(exemplar_index, i) + residual_features(i);
+            }
+            for (int i = 0; i < latent_curr.size; i++)
+            {
+                latent_curr(i) = latent_database(exemplar_index, i) + residual_latent(i);
+            }
+            decompressor_input_norm = sqrtf(squaref(array_norm(features_curr)) + squaref(array_norm(latent_curr)));
             
             // Decompress next pose
             decompressor_evaluate(
@@ -2660,6 +3809,42 @@ int main(void)
                 adjusted_position,
                 adjusted_rotation);
         }
+
+        bool startup_bootstrap_active =
+            g_eval_config.enabled &&
+            eval_frame_index < STARTUP_BOOTSTRAP_WINDOW_FRAMES;
+        float startup_bootstrap_alpha =
+            startup_bootstrap_active ?
+            clampf((eval_frame_index + 1) / (float)STARTUP_BOOTSTRAP_WINDOW_FRAMES, 0.0f, 1.0f) :
+            1.0f;
+
+        if (startup_bootstrap_active)
+        {
+            float root_offset_y = bootstrap_support_root_offset(
+                bone_positions,
+                bone_rotations,
+                curr_bone_contacts,
+                contact_bones,
+                db.bone_parents,
+                environment_boxes,
+                ik_foot_height);
+
+            if (fabsf(root_offset_y) > 1e-4f)
+            {
+                vec3 bootstrap_position = bone_positions(0) + vec3(0.0f, root_offset_y, 0.0f);
+                inertialize_root_adjust(
+                    bone_offset_positions(0),
+                    transition_src_position,
+                    transition_src_rotation,
+                    transition_dst_position,
+                    transition_dst_rotation,
+                    bone_positions(0),
+                    bone_rotations(0),
+                    bootstrap_position,
+                    bone_rotations(0));
+                simulation_position.y += root_offset_y;
+            }
+        }
         
         // Contact fixup with foot locking and IK
 
@@ -2689,32 +3874,61 @@ int main(void)
                     db.bone_parents,
                     toe_bone);
                 
-                // Update the contact state
                 float toe_ground_height = environment_surface_height(
                     global_bone_positions(toe_bone).x,
                     global_bone_positions(toe_bone).z,
                     environment_boxes);
+                vec3 toe_ground_normal = environment_surface_normal(
+                    global_bone_positions(toe_bone).x,
+                    global_bone_positions(toe_bone).z,
+                    environment_boxes);
 
-                contact_update(
-                    contact_states(i),
-                    contact_locks(i),
-                    contact_positions(i),  
-                    contact_velocities(i),
-                    contact_points(i),
-                    contact_targets(i),
-                    contact_offset_positions(i),
-                    contact_offset_velocities(i),
-                    global_bone_positions(toe_bone),
-                    curr_bone_contacts(i),
-                    ik_unlock_radius,
-                    toe_ground_height,
-                    ik_foot_height,
-                    ik_blending_halflife,
-                    dt);
+                if (startup_bootstrap_active)
+                {
+                    contact_bootstrap(
+                        contact_states(i),
+                        contact_locks(i),
+                        contact_positions(i),
+                        contact_velocities(i),
+                        contact_points(i),
+                        contact_targets(i),
+                        contact_offset_positions(i),
+                        contact_offset_velocities(i),
+                        global_bone_positions(toe_bone),
+                        curr_bone_contacts(i),
+                        toe_ground_height,
+                        ik_foot_height);
+                }
+                else
+                {
+                    contact_update(
+                        contact_states(i),
+                        contact_locks(i),
+                        contact_positions(i),  
+                        contact_velocities(i),
+                        contact_points(i),
+                        contact_targets(i),
+                        contact_offset_positions(i),
+                        contact_offset_velocities(i),
+                        global_bone_positions(toe_bone),
+                        curr_bone_contacts(i),
+                        ik_unlock_radius,
+                        toe_ground_height,
+                        ik_foot_height,
+                        ik_blending_halflife,
+                        dt);
+                }
                 
                 // Ensure contact position never goes through floor
                 vec3 contact_position_clamp = contact_positions(i);
                 contact_position_clamp.y = maxf(contact_position_clamp.y, toe_ground_height + ik_foot_height);
+                if (startup_bootstrap_active)
+                {
+                    contact_position_clamp = lerp(
+                        global_bone_positions(toe_bone),
+                        contact_position_clamp,
+                        startup_bootstrap_alpha);
+                }
                 
                 // Re-compute toe, heel, knee, hip, and root bone positions
                 for (int bone : {heel_bone, knee_bone, hip_bone, root_bone})
@@ -2787,13 +4001,27 @@ int main(void)
                 vec3 toe_end_curr = quat_mul_vec3(
                     global_bone_rotations(toe_bone), vec3(ik_toe_length, 0.0f, 0.0f)) + 
                     global_bone_positions(toe_bone);
-                    
-                vec3 toe_end_targ = toe_end_curr;
+                vec3 toe_forward = quat_mul_vec3(global_bone_rotations(toe_bone), vec3(1.0f, 0.0f, 0.0f));
+                vec3 toe_forward_tangent = toe_forward - toe_ground_normal * dot(toe_ground_normal, toe_forward);
+                if (length(toe_forward_tangent) < 1e-4f)
+                {
+                    toe_forward_tangent = normalize(cross(vec3(0.0f, 1.0f, 0.0f), toe_ground_normal));
+                }
+                else
+                {
+                    toe_forward_tangent = normalize(toe_forward_tangent);
+                }
+
+                vec3 toe_end_targ = contact_position_clamp + toe_forward_tangent * ik_toe_length;
                 float toe_end_ground_height = environment_surface_height(
                     toe_end_targ.x,
                     toe_end_targ.z,
                     environment_boxes);
                 toe_end_targ.y = maxf(toe_end_targ.y, toe_end_ground_height + ik_foot_height);
+                if (startup_bootstrap_active)
+                {
+                    toe_end_targ = lerp(toe_end_curr, toe_end_targ, startup_bootstrap_alpha);
+                }
                 
                 ik_look_at(
                     adjusted_bone_rotations(toe_bone),
@@ -2815,6 +4043,218 @@ int main(void)
             adjusted_bone_positions,
             adjusted_bone_rotations,
             db.bone_parents);
+
+        float contact_height_error = 0.0f;
+        float contact_slip = 0.0f;
+        int terrain_penetrations = 0;
+        int active_contacts = 0;
+
+        for (int i = 0; i < contact_bones.size; i++)
+        {
+            int toe_bone = contact_bones(i);
+            vec3 toe_pos = global_bone_positions(toe_bone);
+            float toe_ground_height = environment_surface_height(
+                toe_pos.x,
+                toe_pos.z,
+                environment_boxes);
+
+            if (curr_bone_contacts(i))
+            {
+                active_contacts++;
+                contact_height_error += fabsf(toe_pos.y - (toe_ground_height + ik_foot_height));
+                if (toe_pos.y < toe_ground_height + ik_foot_height - 1e-3f)
+                {
+                    terrain_penetrations++;
+                }
+                if (eval_prev_contact_valid(i))
+                {
+                    vec3 delta = toe_pos - eval_prev_contact_positions(i);
+                    contact_slip += sqrtf(squaref(delta.x) + squaref(delta.z)) / dt;
+                }
+                eval_prev_contact_valid(i) = true;
+                eval_prev_contact_positions(i) = toe_pos;
+            }
+            else
+            {
+                eval_prev_contact_valid(i) = false;
+            }
+        }
+
+        if (active_contacts > 0)
+        {
+            contact_height_error /= active_contacts;
+            contact_slip /= active_contacts;
+        }
+
+        runtime_prev_contact_slip = contact_slip;
+        runtime_prev_contact_height_error = contact_height_error;
+        runtime_prev_terrain_penetrations = terrain_penetrations;
+        bool severe_penetration =
+            active_contacts > 0 &&
+            (float)terrain_penetrations / (float)active_contacts > 0.5f &&
+            contact_height_error > STARTUP_SEVERE_PENETRATION;
+        runtime_emergency_reanchor =
+            startup_bootstrap_active ?
+            severe_penetration :
+            (contact_slip > HYBRID_CONTACT_SLIP_HARD_RESET ||
+             terrain_penetrations > 0 ||
+             hybrid_residual_norm(residual_features, residual_latent) > HYBRID_RESIDUAL_NORM_MAX * 0.9f);
+
+        if (g_eval_config.enabled && eval_trace != NULL)
+        {
+
+            runtime_debug_snapshot snapshot;
+            snapshot.frame = eval_frame_index;
+            snapshot.teacher_frame = teacher_frame_index;
+            snapshot.selected_exemplar = exemplar_index;
+            snapshot.exemplar_valid = exemplar_valid;
+            snapshot.switch_flag = switch_flag;
+            snapshot.residual_norm_before = residual_norm_before;
+            snapshot.residual_norm_after = residual_norm_after;
+            snapshot.stepper_input_norm = stepper_input_norm;
+            snapshot.stepper_output_norm = stepper_output_norm;
+            snapshot.decompressor_input_norm = decompressor_input_norm;
+            snapshot.root_planar_speed = planar_speed(bone_velocities(0));
+            snapshot.contact_slip = contact_slip;
+            snapshot.correction_magnitude = projector_correction_mag;
+            snapshot.switch_severity = switch_severity;
+            snapshot.residual_carry_alpha = residual_carry_alpha;
+            snapshot.selector_margin = selector_margin;
+            snapshot.exemplar_dwell_frames = exemplar_dwell_frames;
+            snapshot.emergency_reanchor = emergency_reanchor;
+            snapshot.hard_reset = hard_reset;
+            snapshot.finite_query = array_is_finite(query_normalized);
+            snapshot.finite_features = array_is_finite(features_curr);
+            snapshot.finite_latent = array_is_finite(latent_curr);
+            snapshot.finite_residual = array_is_finite(residual_features) && array_is_finite(residual_latent);
+            snapshot.finite_stepper = isfinite(stepper_input_norm) && isfinite(stepper_output_norm);
+            snapshot.finite_decompressor = isfinite(decompressor_input_norm);
+            snapshot.finite_pose = vec3_array_is_finite(bone_positions) && vec3_array_is_finite(bone_velocities);
+            snapshot.topk_indices = copy_array_int(topk_indices);
+            snapshot.topk_costs = copy_array(topk_costs);
+            snapshot.selector_scores = copy_array(selector_scores);
+            snapshot.query_normalized = copy_array(query_normalized);
+            snapshot.features_curr = copy_array(features_curr);
+            snapshot.latent_curr = copy_array(latent_curr);
+            snapshot.residual_features = copy_array(residual_features);
+            snapshot.residual_latent = copy_array(residual_latent);
+            snapshot.stepper_control = copy_array(stepper_control);
+            snapshot.divergence_flag =
+                snapshot.root_planar_speed > db.root_speed_limit * 5.0f ||
+                snapshot.contact_slip > 50.0f ||
+                snapshot.correction_magnitude > 50.0f ||
+                snapshot.residual_norm_after > HYBRID_RESIDUAL_NORM_MAX ||
+                snapshot.stepper_input_norm > HYBRID_STEPPER_INPUT_NORM_MAX ||
+                snapshot.decompressor_input_norm > 200.0f;
+
+            failure_history.push_back(snapshot);
+            if ((int)failure_history.size() > 30)
+            {
+                failure_history.erase(failure_history.begin());
+            }
+
+            bool frame_nonfinite =
+                !snapshot.finite_query ||
+                !snapshot.finite_features ||
+                !snapshot.finite_latent ||
+                !snapshot.finite_residual ||
+                !snapshot.finite_stepper ||
+                !snapshot.finite_decompressor ||
+                !snapshot.finite_pose ||
+                !isfinite(snapshot.root_planar_speed) ||
+                !isfinite(snapshot.correction_magnitude) ||
+                !isfinite(stepper_drift_mag) ||
+                !isfinite(contact_height_error) ||
+                !isfinite(contact_slip);
+
+            if (!failure_triggered && (frame_nonfinite || snapshot.divergence_flag))
+            {
+                failure_triggered = true;
+                failure_future_remaining = 5;
+            }
+            else if (failure_triggered && !failure_dump_written && failure_future_remaining > 0)
+            {
+                failure_future.push_back(snapshot);
+                failure_future_remaining--;
+            }
+
+            if (failure_triggered && !failure_dump_written && failure_future_remaining == 0)
+            {
+                std::string dump_dir = g_eval_config.failure_dump_dir.empty() ? "." : g_eval_config.failure_dump_dir;
+                std::string dump_path = dump_dir + "/" + g_eval_config.tag + "_failure_dump.txt";
+                FILE* dump = fopen(dump_path.c_str(), "w");
+                if (dump != NULL)
+                {
+                    fprintf(dump, "tag=%s selector_mode=%s residual_mode=%s\n", g_eval_config.tag.c_str(), g_eval_config.selector_mode.c_str(), g_eval_config.residual_mode.c_str());
+                    fprintf(dump, "history\n");
+                    for (const runtime_debug_snapshot& item : failure_history)
+                    {
+                        write_runtime_snapshot(dump, item);
+                    }
+                    fprintf(dump, "future\n");
+                    for (const runtime_debug_snapshot& item : failure_future)
+                    {
+                        write_runtime_snapshot(dump, item);
+                    }
+                    fclose(dump);
+                }
+                failure_dump_written = true;
+                eval_complete = true;
+            }
+
+            fprintf(
+                eval_trace,
+                "%d,%.6f,%.6f,%.6f,%.6f,%d,%d,%d,%d,%d,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%d,%.6f,%.6f,%.6f,%.6f,%.6f,",
+                eval_frame_index,
+                eval_frame_index * dt,
+                bone_positions(0).x,
+                bone_positions(0).y,
+                bone_positions(0).z,
+                teacher_frame_index,
+                exemplar_index,
+                exemplar_valid ? 1 : 0,
+                switch_flag ? 1 : 0,
+                snapshot.divergence_flag ? 1 : 0,
+                residual_norm_before,
+                residual_norm_after,
+                stepper_input_norm,
+                stepper_output_norm,
+                decompressor_input_norm,
+                snapshot.root_planar_speed,
+                contact_height_error,
+                contact_slip,
+                terrain_penetrations,
+                projector_correction_mag,
+                stepper_drift_mag,
+                switch_severity,
+                residual_carry_alpha,
+                selector_margin);
+            fprintf(
+                eval_trace,
+                "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%s,%s,%s\n",
+                exemplar_dwell_frames,
+                emergency_reanchor ? 1 : 0,
+                hard_reset ? 1 : 0,
+                snapshot.finite_query ? 1 : 0,
+                snapshot.finite_features ? 1 : 0,
+                snapshot.finite_latent ? 1 : 0,
+                snapshot.finite_residual ? 1 : 0,
+                snapshot.finite_stepper ? 1 : 0,
+                snapshot.finite_decompressor ? 1 : 0,
+                snapshot.finite_pose ? 1 : 0,
+                lmm_enabled ? "learned" : "ordinary",
+                g_eval_config.selector_mode.c_str(),
+                g_eval_config.residual_mode.c_str());
+
+            eval_frame_index++;
+            if (eval_frame_index >= g_eval_config.frames)
+            {
+                fclose(eval_trace);
+                eval_trace = NULL;
+                eval_complete = true;
+                return;
+            }
+        }
         
         // Update camera
         
@@ -2842,6 +4282,11 @@ int main(void)
                 gamepadstick_right,
                 desired_strafe,
                 dt);
+        }
+
+        if (g_eval_config.enabled)
+        {
+            return;
         }
 
         // Render
@@ -3247,17 +4692,25 @@ int main(void)
     std::function<void()> u{update_func};
     emscripten_set_main_loop_arg(update_callback, &u, 0, 1);
 #else
-    while (!WindowShouldClose())
+    while (!WindowShouldClose() && !eval_complete)
     {
         update_func();
     }
 #endif
 
     // Unload stuff and finish
-    UnloadModel(character_model);
-    UnloadModel(ground_plane_model);
-    UnloadShader(character_shader);
-    UnloadShader(ground_plane_shader);
+    if (!g_eval_config.enabled)
+    {
+        UnloadModel(character_model);
+        UnloadModel(ground_plane_model);
+        UnloadShader(character_shader);
+        UnloadShader(ground_plane_shader);
+    }
+    if (eval_trace != NULL)
+    {
+        fclose(eval_trace);
+        eval_trace = NULL;
+    }
 
     CloseWindow();
 

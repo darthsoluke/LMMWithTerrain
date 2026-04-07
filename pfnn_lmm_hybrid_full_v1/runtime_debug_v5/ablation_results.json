@@ -1,0 +1,110 @@
+{
+  "teacher_selector_teacher_residual": {
+    "flat": {
+      "trace": "/home/zhouyingchengliao/project/LMMWithEnv/Motion-Matching/pfnn_lmm_hybrid_full_v1/runtime_debug_v5/traces/teacher_selector_teacher_residual_flat.csv",
+      "failure_dump": null,
+      "has_nonfinite": false
+    },
+    "uphill": {
+      "trace": "/home/zhouyingchengliao/project/LMMWithEnv/Motion-Matching/pfnn_lmm_hybrid_full_v1/runtime_debug_v5/traces/teacher_selector_teacher_residual_uphill.csv",
+      "failure_dump": "/home/zhouyingchengliao/project/LMMWithEnv/Motion-Matching/pfnn_lmm_hybrid_full_v1/runtime_debug_v5/failure_dumps/teacher_selector_teacher_residual_uphill_failure_dump.txt",
+      "has_nonfinite": false
+    },
+    "downhill": {
+      "trace": "/home/zhouyingchengliao/project/LMMWithEnv/Motion-Matching/pfnn_lmm_hybrid_full_v1/runtime_debug_v5/traces/teacher_selector_teacher_residual_downhill.csv",
+      "failure_dump": "/home/zhouyingchengliao/project/LMMWithEnv/Motion-Matching/pfnn_lmm_hybrid_full_v1/runtime_debug_v5/failure_dumps/teacher_selector_teacher_residual_downhill_failure_dump.txt",
+      "has_nonfinite": false
+    },
+    "rough": {
+      "trace": "/home/zhouyingchengliao/project/LMMWithEnv/Motion-Matching/pfnn_lmm_hybrid_full_v1/runtime_debug_v5/traces/teacher_selector_teacher_residual_rough.csv",
+      "failure_dump": "/home/zhouyingchengliao/project/LMMWithEnv/Motion-Matching/pfnn_lmm_hybrid_full_v1/runtime_debug_v5/failure_dumps/teacher_selector_teacher_residual_rough_failure_dump.txt",
+      "has_nonfinite": false
+    },
+    "obstacle": {
+      "trace": "/home/zhouyingchengliao/project/LMMWithEnv/Motion-Matching/pfnn_lmm_hybrid_full_v1/runtime_debug_v5/traces/teacher_selector_teacher_residual_obstacle.csv",
+      "failure_dump": "/home/zhouyingchengliao/project/LMMWithEnv/Motion-Matching/pfnn_lmm_hybrid_full_v1/runtime_debug_v5/failure_dumps/teacher_selector_teacher_residual_obstacle_failure_dump.txt",
+      "has_nonfinite": false
+    }
+  },
+  "teacher_selector_learned_residual": {
+    "flat": {
+      "trace": "/home/zhouyingchengliao/project/LMMWithEnv/Motion-Matching/pfnn_lmm_hybrid_full_v1/runtime_debug_v5/traces/teacher_selector_learned_residual_flat.csv",
+      "failure_dump": null,
+      "has_nonfinite": false
+    },
+    "uphill": {
+      "trace": "/home/zhouyingchengliao/project/LMMWithEnv/Motion-Matching/pfnn_lmm_hybrid_full_v1/runtime_debug_v5/traces/teacher_selector_learned_residual_uphill.csv",
+      "failure_dump": "/home/zhouyingchengliao/project/LMMWithEnv/Motion-Matching/pfnn_lmm_hybrid_full_v1/runtime_debug_v5/failure_dumps/teacher_selector_learned_residual_uphill_failure_dump.txt",
+      "has_nonfinite": false
+    },
+    "downhill": {
+      "trace": "/home/zhouyingchengliao/project/LMMWithEnv/Motion-Matching/pfnn_lmm_hybrid_full_v1/runtime_debug_v5/traces/teacher_selector_learned_residual_downhill.csv",
+      "failure_dump": "/home/zhouyingchengliao/project/LMMWithEnv/Motion-Matching/pfnn_lmm_hybrid_full_v1/runtime_debug_v5/failure_dumps/teacher_selector_learned_residual_downhill_failure_dump.txt",
+      "has_nonfinite": false
+    },
+    "rough": {
+      "trace": "/home/zhouyingchengliao/project/LMMWithEnv/Motion-Matching/pfnn_lmm_hybrid_full_v1/runtime_debug_v5/traces/teacher_selector_learned_residual_rough.csv",
+      "failure_dump": "/home/zhouyingchengliao/project/LMMWithEnv/Motion-Matching/pfnn_lmm_hybrid_full_v1/runtime_debug_v5/failure_dumps/teacher_selector_learned_residual_rough_failure_dump.txt",
+      "has_nonfinite": false
+    },
+    "obstacle": {
+      "trace": "/home/zhouyingchengliao/project/LMMWithEnv/Motion-Matching/pfnn_lmm_hybrid_full_v1/runtime_debug_v5/traces/teacher_selector_learned_residual_obstacle.csv",
+      "failure_dump": null,
+      "has_nonfinite": false
+    }
+  },
+  "learned_selector_zero_residual": {
+    "flat": {
+      "trace": "/home/zhouyingchengliao/project/LMMWithEnv/Motion-Matching/pfnn_lmm_hybrid_full_v1/runtime_debug_v5/traces/learned_selector_zero_residual_flat.csv",
+      "failure_dump": "/home/zhouyingchengliao/project/LMMWithEnv/Motion-Matching/pfnn_lmm_hybrid_full_v1/runtime_debug_v5/failure_dumps/learned_selector_zero_residual_flat_failure_dump.txt",
+      "has_nonfinite": false
+    },
+    "uphill": {
+      "trace": "/home/zhouyingchengliao/project/LMMWithEnv/Motion-Matching/pfnn_lmm_hybrid_full_v1/runtime_debug_v5/traces/learned_selector_zero_residual_uphill.csv",
+      "failure_dump": "/home/zhouyingchengliao/project/LMMWithEnv/Motion-Matching/pfnn_lmm_hybrid_full_v1/runtime_debug_v5/failure_dumps/learned_selector_zero_residual_uphill_failure_dump.txt",
+      "has_nonfinite": false
+    },
+    "downhill": {
+      "trace": "/home/zhouyingchengliao/project/LMMWithEnv/Motion-Matching/pfnn_lmm_hybrid_full_v1/runtime_debug_v5/traces/learned_selector_zero_residual_downhill.csv",
+      "failure_dump": "/home/zhouyingchengliao/project/LMMWithEnv/Motion-Matching/pfnn_lmm_hybrid_full_v1/runtime_debug_v5/failure_dumps/learned_selector_zero_residual_downhill_failure_dump.txt",
+      "has_nonfinite": false
+    },
+    "rough": {
+      "trace": "/home/zhouyingchengliao/project/LMMWithEnv/Motion-Matching/pfnn_lmm_hybrid_full_v1/runtime_debug_v5/traces/learned_selector_zero_residual_rough.csv",
+      "failure_dump": "/home/zhouyingchengliao/project/LMMWithEnv/Motion-Matching/pfnn_lmm_hybrid_full_v1/runtime_debug_v5/failure_dumps/learned_selector_zero_residual_rough_failure_dump.txt",
+      "has_nonfinite": false
+    },
+    "obstacle": {
+      "trace": "/home/zhouyingchengliao/project/LMMWithEnv/Motion-Matching/pfnn_lmm_hybrid_full_v1/runtime_debug_v5/traces/learned_selector_zero_residual_obstacle.csv",
+      "failure_dump": null,
+      "has_nonfinite": false
+    }
+  },
+  "learned_selector_learned_residual": {
+    "flat": {
+      "trace": "/home/zhouyingchengliao/project/LMMWithEnv/Motion-Matching/pfnn_lmm_hybrid_full_v1/runtime_debug_v5/traces/learned_selector_learned_residual_flat.csv",
+      "failure_dump": null,
+      "has_nonfinite": false
+    },
+    "uphill": {
+      "trace": "/home/zhouyingchengliao/project/LMMWithEnv/Motion-Matching/pfnn_lmm_hybrid_full_v1/runtime_debug_v5/traces/learned_selector_learned_residual_uphill.csv",
+      "failure_dump": "/home/zhouyingchengliao/project/LMMWithEnv/Motion-Matching/pfnn_lmm_hybrid_full_v1/runtime_debug_v5/failure_dumps/learned_selector_learned_residual_uphill_failure_dump.txt",
+      "has_nonfinite": false
+    },
+    "downhill": {
+      "trace": "/home/zhouyingchengliao/project/LMMWithEnv/Motion-Matching/pfnn_lmm_hybrid_full_v1/runtime_debug_v5/traces/learned_selector_learned_residual_downhill.csv",
+      "failure_dump": "/home/zhouyingchengliao/project/LMMWithEnv/Motion-Matching/pfnn_lmm_hybrid_full_v1/runtime_debug_v5/failure_dumps/learned_selector_learned_residual_downhill_failure_dump.txt",
+      "has_nonfinite": false
+    },
+    "rough": {
+      "trace": "/home/zhouyingchengliao/project/LMMWithEnv/Motion-Matching/pfnn_lmm_hybrid_full_v1/runtime_debug_v5/traces/learned_selector_learned_residual_rough.csv",
+      "failure_dump": "/home/zhouyingchengliao/project/LMMWithEnv/Motion-Matching/pfnn_lmm_hybrid_full_v1/runtime_debug_v5/failure_dumps/learned_selector_learned_residual_rough_failure_dump.txt",
+      "has_nonfinite": false
+    },
+    "obstacle": {
+      "trace": "/home/zhouyingchengliao/project/LMMWithEnv/Motion-Matching/pfnn_lmm_hybrid_full_v1/runtime_debug_v5/traces/learned_selector_learned_residual_obstacle.csv",
+      "failure_dump": null,
+      "has_nonfinite": false
+    }
+  }
+}

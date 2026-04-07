@@ -29,11 +29,49 @@ except ModuleNotFoundError:
         def close(self):
             pass
 
-from train_common import load_database, load_features, save_network
+from train_common import (
+    TerrainGrid,
+    build_valid_spans,
+    cleanup_distributed,
+    default_frame_mask_path,
+    distributed_mean,
+    init_distributed,
+    is_main_process,
+    load_database,
+    load_features,
+    load_frame_mask,
+    sample_window_batch,
+    save_network,
+    save_valid_spans,
+    unwrap_model,
+    valid_window_starts,
+)
 
 
 def safe_scalar_std(x, eps=1e-8):
     return max(float(x), eps)
+
+
+def sample_terrain_height_torch(grid_values, x_min, x_max, z_min, z_max, xs, zs):
+    width = grid_values.shape[1]
+    height = grid_values.shape[0]
+
+    px = (xs - x_min) / max(float(x_max - x_min), 1e-5) * (width - 1)
+    pz = (zs - z_min) / max(float(z_max - z_min), 1e-5) * (height - 1)
+
+    x0 = torch.clamp(torch.floor(px).long(), 0, width - 1)
+    x1 = torch.clamp(torch.ceil(px).long(), 0, width - 1)
+    z0 = torch.clamp(torch.floor(pz).long(), 0, height - 1)
+    z1 = torch.clamp(torch.ceil(pz).long(), 0, height - 1)
+
+    ax = px - torch.floor(px)
+    az = pz - torch.floor(pz)
+
+    s0 = grid_values[z0, x0]
+    s1 = grid_values[z0, x1]
+    s2 = grid_values[z1, x0]
+    s3 = grid_values[z1, x1]
+    return (s0 * (1.0 - ax) + s1 * ax) * (1.0 - az) + (s2 * (1.0 - ax) + s3 * ax) * az
 
 # Networks
 
@@ -83,6 +121,9 @@ def parse_args():
     parser.add_argument('--niter', type=int, default=100000)
     parser.add_argument('--save-every', type=int, default=1000)
     parser.add_argument('--lr', type=float, default=0.001)
+    parser.add_argument('--frame-mask', default=None)
+    parser.add_argument('--terrain-grid', default='pfnn_terrain_rocky_grid.bin')
+    parser.add_argument('--valid-spans-out', default='decompressor_valid_spans.json')
     return parser.parse_args()
 
 if __name__ == '__main__':
@@ -108,6 +149,8 @@ if __name__ == '__main__':
     nextra = contacts.shape[1]
     nfeatures = X.shape[1]
     nlatent = 32
+    support_bones = np.array([4, 5, 8, 9], dtype=np.int64)
+    support_contact_index = np.array([0, 0, 1, 1], dtype=np.int64)
     
     # Parameters
     
@@ -118,21 +161,24 @@ if __name__ == '__main__':
     window = 2
     dt = 1.0 / 60.0
 
-    if args.device is not None:
-        device = torch.device(args.device)
-    elif torch.cuda.is_available():
-        device = torch.device(f'cuda:{args.gpu}')
-    else:
-        device = torch.device('cpu')
+    ctx = init_distributed(args.device, args.gpu)
+    device = ctx.device
+    np.random.seed(seed + ctx.rank)
+    torch.manual_seed(seed + ctx.rank)
+    if is_main_process(ctx):
+        print(f'Using device: {device}, world_size={ctx.world_size}')
 
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.set_num_threads(1)
-    if device.type == 'cuda':
-        torch.cuda.set_device(device)
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-    print(f'Using device: {device}')
+    frame_mask_path = args.frame_mask or default_frame_mask_path('./database.bin')
+    frame_valid = load_frame_mask(frame_mask_path)
+    if frame_valid.shape[0] != nframes:
+        raise RuntimeError(f'frame mask size mismatch: {frame_valid.shape[0]} vs {nframes}')
+    spans = build_valid_spans(range_starts, range_stops, frame_valid)
+    valid_starts = valid_window_starts(spans, window)
+    if len(valid_starts) == 0:
+        raise RuntimeError('no valid decompressor spans found')
+    save_valid_spans(args.valid_spans_out, spans)
+
+    terrain_grid = TerrainGrid.load(args.terrain_grid)
     
     # Compute world space
     
@@ -233,29 +279,40 @@ if __name__ == '__main__':
     
     # Make PyTorch tensors
     
-    Ypos = torch.as_tensor(Ypos)
-    Yrot = torch.as_tensor(Yrot)
-    Ytxy = torch.as_tensor(Ytxy)
-    Yvel = torch.as_tensor(Yvel)
-    Yang = torch.as_tensor(Yang)
+    preload_device = device if device.type == 'cuda' else None
+    Ypos = torch.as_tensor(Ypos, device=preload_device)
+    Yrot = torch.as_tensor(Yrot, device=preload_device)
+    Ytxy = torch.as_tensor(Ytxy, device=preload_device)
+    Yvel = torch.as_tensor(Yvel, device=preload_device)
+    Yang = torch.as_tensor(Yang, device=preload_device)
     
-    Qpos = torch.as_tensor(Qpos)
-    Qrot = torch.as_tensor(Qrot)
-    Qxfm = torch.as_tensor(Qxfm)
-    Qtxy = torch.as_tensor(Qtxy)
-    Qvel = torch.as_tensor(Qvel)
-    Qang = torch.as_tensor(Qang)
+    Qpos = torch.as_tensor(Qpos, device=preload_device)
+    Qrot = torch.as_tensor(Qrot, device=preload_device)
+    Qxfm = torch.as_tensor(Qxfm, device=preload_device)
+    Qtxy = torch.as_tensor(Qtxy, device=preload_device)
+    Qvel = torch.as_tensor(Qvel, device=preload_device)
+    Qang = torch.as_tensor(Qang, device=preload_device)
     
-    Yrvel = torch.as_tensor(Yrvel)
-    Yrang = torch.as_tensor(Yrang)
-    Yextra = torch.as_tensor(Yextra)
+    Yrvel = torch.as_tensor(Yrvel, device=preload_device)
+    Yrang = torch.as_tensor(Yrang, device=preload_device)
+    Yextra = torch.as_tensor(Yextra, device=preload_device)
     
-    X = torch.as_tensor(X)
+    X = torch.as_tensor(X, device=preload_device)
+    support_bones_t = torch.as_tensor(support_bones, dtype=torch.long, device=device)
+    support_contact_index_t = torch.as_tensor(support_contact_index, dtype=torch.long, device=device)
+    terrain_grid_t = torch.as_tensor(terrain_grid.data, dtype=torch.float32, device=device)
     
     # Make networks
     
     network_compressor = Compressor(len(compressor_mean_in), nlatent).to(device)
     network_decompressor = Decompressor(nfeatures + nlatent, len(decompressor_mean_out)).to(device)
+    if ctx.enabled:
+        ddp_kwargs = {
+            "device_ids": [ctx.local_rank] if device.type == "cuda" else None,
+            "output_device": ctx.local_rank if device.type == "cuda" else None,
+        }
+        network_compressor = nn.parallel.DistributedDataParallel(network_compressor, **ddp_kwargs)
+        network_decompressor = nn.parallel.DistributedDataParallel(network_decompressor, **ddp_kwargs)
     
     # Function to save compressed database
     
@@ -265,6 +322,7 @@ if __name__ == '__main__':
             
             chunk_size = 4096
             latent_chunks = []
+            compressor_model = unwrap_model(network_compressor)
             for start in range(0, nframes, chunk_size):
                 stop = min(start + chunk_size, nframes)
                 chunk = torch.cat([
@@ -281,7 +339,7 @@ if __name__ == '__main__':
                     Yextra[start:stop].reshape([1, stop-start, -1]).to(device),
                 ], dim=-1)
                 latent_chunks.append(
-                    network_compressor((chunk - compressor_mean_in) / compressor_std_in)[0].cpu()
+                    compressor_model((chunk - compressor_mean_in) / compressor_std_in)[0].cpu()
                 )
             Z = torch.cat(latent_chunks, dim=0)
             
@@ -298,9 +356,9 @@ if __name__ == '__main__':
             
             # Get slice of database for first clip
             
-            preview_index = min(2, len(range_starts) - 1)
-            start = range_starts[preview_index]
-            stop = min(start + 1000, range_stops[preview_index])
+            preview_index = min(2, len(spans) - 1)
+            start, stop = spans[preview_index]
+            stop = min(start + 1000, stop)
             
             Ygnd_pos = Ypos[start:stop][np.newaxis].to(device)
             Ygnd_rot = Yrot[start:stop][np.newaxis].to(device)
@@ -321,7 +379,10 @@ if __name__ == '__main__':
             
             # Pass through compressor
             
-            Zgnd = network_compressor((torch.cat([
+            compressor_model = unwrap_model(network_compressor)
+            decompressor_model = unwrap_model(network_decompressor)
+
+            Zgnd = compressor_model((torch.cat([
                 Ygnd_pos[:,:,1:].reshape([1, stop-start, -1]),
                 Ygnd_txy[:,:,1:].reshape([1, stop-start, -1]),
                 Ygnd_vel[:,:,1:].reshape([1, stop-start, -1]),
@@ -337,7 +398,7 @@ if __name__ == '__main__':
             
             # Pass through decompressor
             
-            Ytil = (network_decompressor(torch.cat([Xgnd, Zgnd], dim=-1)) * 
+            Ytil = (decompressor_model(torch.cat([Xgnd, Zgnd], dim=-1)) * 
                 decompressor_std_out + decompressor_mean_out)
             
             # Extract required components
@@ -425,16 +486,9 @@ if __name__ == '__main__':
 
             plt.close()
     
-    # Build batches respecting window size
-    
-    indices = []
-    for i in range(nframes - window):
-        indices.append(np.arange(i, i + window))
-    indices = torch.as_tensor(np.array(indices), dtype=torch.long)
-    
     # Train
     
-    writer = SummaryWriter()
+    writer = SummaryWriter() if is_main_process(ctx) else SummaryWriter()
 
     optimizer = torch.optim.AdamW(
         list(network_compressor.parameters()) + 
@@ -455,25 +509,25 @@ if __name__ == '__main__':
         
         # Extract batch
         
-        batch = indices[torch.randint(0, len(indices), size=[batchsize])]
+        batch = torch.as_tensor(sample_window_batch(valid_starts, window, batchsize), dtype=torch.long, device=preload_device)
         
-        Xgnd = X[batch].to(device)
+        Xgnd = X[batch]
         
-        Ygnd_pos = Ypos[batch].to(device)
-        Ygnd_txy = Ytxy[batch].to(device)
-        Ygnd_vel = Yvel[batch].to(device)
-        Ygnd_ang = Yang[batch].to(device)
+        Ygnd_pos = Ypos[batch]
+        Ygnd_txy = Ytxy[batch]
+        Ygnd_vel = Yvel[batch]
+        Ygnd_ang = Yang[batch]
         
-        Qgnd_pos = Qpos[batch].to(device)
-        Qgnd_xfm = Qxfm[batch].to(device)
-        Qgnd_txy = Qtxy[batch].to(device)
-        Qgnd_vel = Qvel[batch].to(device)
-        Qgnd_ang = Qang[batch].to(device)
+        Qgnd_pos = Qpos[batch]
+        Qgnd_xfm = Qxfm[batch]
+        Qgnd_txy = Qtxy[batch]
+        Qgnd_vel = Qvel[batch]
+        Qgnd_ang = Qang[batch]
         
-        Ygnd_rvel = Yrvel[batch].to(device)
-        Ygnd_rang = Yrang[batch].to(device)
+        Ygnd_rvel = Yrvel[batch]
+        Ygnd_rang = Yrang[batch]
         
-        Ygnd_extra = Yextra[batch].to(device)
+        Ygnd_extra = Yextra[batch]
         
         # Encode
         
@@ -538,6 +592,27 @@ if __name__ == '__main__':
         Qtil_drot = (Qtil_xfm[:,1:] - Qtil_xfm[:,:-1]) / dt
         
         Zdgnd = (Zgnd[:,1:] - Zgnd[:,:-1]) / dt
+
+        # Terrain-contact losses in world space
+
+        support_pos = Gtil_pos.index_select(2, support_bones_t)
+        support_vel = Gtil_vel.index_select(2, support_bones_t)
+        contact_mask = Ygnd_extra.index_select(2, support_contact_index_t).to(torch.float32)
+        support_ground = sample_terrain_height_torch(
+            terrain_grid_t,
+            terrain_grid.x_min,
+            terrain_grid.x_max,
+            terrain_grid.z_min,
+            terrain_grid.z_max,
+            support_pos[..., 0],
+            support_pos[..., 2],
+        )
+        support_clearance = support_pos[..., 1] - support_ground
+        active_contacts = torch.clamp(contact_mask.sum(), min=1.0)
+        support_contact_abs = torch.sum(torch.abs(support_clearance) * contact_mask) / active_contacts
+        support_contact_vy = torch.sum(torch.abs(support_vel[..., 1]) * contact_mask) / active_contacts
+        support_penetration = torch.sum(torch.relu(-support_clearance) * contact_mask) / active_contacts
+        support_floating = torch.sum(torch.relu(support_clearance - 0.06) * contact_mask) / active_contacts
         
         # Compute losses
         
@@ -562,6 +637,10 @@ if __name__ == '__main__':
         loss_sreg = torch.mean(0.1  * torch.abs(Zgnd))
         loss_lreg = torch.mean(0.1  * torch.square(Zgnd))
         loss_vreg = torch.mean(0.01 * torch.abs(Zdgnd))
+        loss_terrain_contact = 15.0 * support_contact_abs
+        loss_terrain_vy = 5.0 * support_contact_vy
+        loss_terrain_penetration = 25.0 * support_penetration
+        loss_terrain_floating = 10.0 * support_floating
         
         loss = (
             loss_loc_pos + 
@@ -581,7 +660,11 @@ if __name__ == '__main__':
             loss_cvel_rot + 
             loss_sreg + 
             loss_lreg +
-            loss_vreg)
+            loss_vreg +
+            loss_terrain_contact +
+            loss_terrain_vy +
+            loss_terrain_penetration +
+            loss_terrain_floating)
                 
         # Backprop
         
@@ -591,53 +674,62 @@ if __name__ == '__main__':
     
         # Logging
         
-        writer.add_scalar('decompressor/loss', loss.item(), i)
+        mean_loss = distributed_mean(loss.item(), ctx)
+
+        if is_main_process(ctx):
+            writer.add_scalar('decompressor/loss', mean_loss, i)
+            writer.add_scalars('decompressor/loss_terms', {
+                'loc_pos': loss_loc_pos.item(),
+                'loc_txy': loss_loc_txy.item(),
+                'loc_vel': loss_loc_vel.item(),
+                'loc_ang': loss_loc_ang.item(),
+                'loc_rvel': loss_loc_rvel.item(),
+                'loc_rang': loss_loc_rang.item(),
+                'loc_extra': loss_loc_extra.item(),
+                'chr_pos': loss_chr_pos.item(),
+                'chr_xfm': loss_chr_xfm.item(),
+                'chr_vel': loss_chr_vel.item(),
+                'chr_ang': loss_chr_ang.item(),
+                'lvel_pos': loss_lvel_pos.item(),
+                'lvel_rot': loss_lvel_rot.item(),
+                'cvel_pos': loss_cvel_pos.item(),
+                'cvel_rot': loss_cvel_rot.item(),
+                'sreg': loss_sreg.item(),
+                'lreg': loss_lreg.item(),
+                'vreg': loss_vreg.item(),
+                'terrain_contact': loss_terrain_contact.item(),
+                'terrain_vy': loss_terrain_vy.item(),
+                'terrain_penetration': loss_terrain_penetration.item(),
+                'terrain_floating': loss_terrain_floating.item(),
+            }, i)
+            writer.add_scalars('decompressor/latent', {
+                'mean': Zgnd.mean().item(),
+                'std': Zgnd.std().item(),
+            }, i)
         
-        writer.add_scalars('decompressor/loss_terms', {
-            'loc_pos': loss_loc_pos.item(),
-            'loc_txy': loss_loc_txy.item(),
-            'loc_vel': loss_loc_vel.item(),
-            'loc_ang': loss_loc_ang.item(),
-            'loc_rvel': loss_loc_rvel.item(),
-            'loc_rang': loss_loc_rang.item(),
-            'loc_extra': loss_loc_extra.item(),
-            'chr_pos': loss_chr_pos.item(),
-            'chr_xfm': loss_chr_xfm.item(),
-            'chr_vel': loss_chr_vel.item(),
-            'chr_ang': loss_chr_ang.item(),
-            'lvel_pos': loss_lvel_pos.item(),
-            'lvel_rot': loss_lvel_rot.item(),
-            'cvel_pos': loss_cvel_pos.item(),
-            'cvel_rot': loss_cvel_rot.item(),
-            'sreg': loss_sreg.item(),
-            'lreg': loss_lreg.item(),
-            'vreg': loss_vreg.item(),
-        }, i)
+            if rolling_loss is None:
+                rolling_loss = mean_loss
+            else:
+                rolling_loss = rolling_loss * 0.99 + mean_loss * 0.01
         
-        writer.add_scalars('decompressor/latent', {
-            'mean': Zgnd.mean().item(),
-            'std': Zgnd.std().item(),
-        }, i)
-        
-        if rolling_loss is None:
-            rolling_loss = loss.item()
-        else:
-            rolling_loss = rolling_loss * 0.99 + loss.item() * 0.01
-        
-        if i % 10 == 0:
+        if i % 10 == 0 and is_main_process(ctx):
             sys.stdout.write('\rIter: %7i Loss: %5.3f' % (i, rolling_loss))
         
-        if i % args.save_every == 0:
+        if i % args.save_every == 0 and is_main_process(ctx):
+            decompressor_model = unwrap_model(network_decompressor)
             generate_animation()
             save_compressed_database()
             save_network('decompressor.bin', [
-                network_decompressor.linear0, 
-                network_decompressor.linear1],
+                decompressor_model.linear0, 
+                decompressor_model.linear1],
                 decompressor_mean_in,
                 decompressor_std_in,
                 decompressor_mean_out,
                 decompressor_std_out)
-            
         if i % args.save_every == 0:
             scheduler.step()
+        if i % args.save_every == 0 and ctx.enabled:
+            torch.distributed.barrier()
+
+    cleanup_distributed(ctx)
             

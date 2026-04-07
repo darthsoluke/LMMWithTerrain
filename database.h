@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <math.h>
 #include <algorithm>
+#include <string>
 #include <vector>
 
 //--------------------------------------
@@ -124,6 +125,65 @@ void database_build_search_mask(
     }
 }
 
+bool frame_mask_load(array1d<bool>& frame_mask, const char* filename)
+{
+    FILE* f = fopen(filename, "rb");
+    if (f == NULL)
+    {
+        return false;
+    }
+
+    int nframes = 0;
+    fread(&nframes, sizeof(int), 1, f);
+    if (nframes <= 0)
+    {
+        fclose(f);
+        return false;
+    }
+
+    std::vector<unsigned char> mask_bytes(nframes);
+    fread(mask_bytes.data(), sizeof(unsigned char), nframes, f);
+    fclose(f);
+
+    frame_mask.resize(nframes);
+    for (int i = 0; i < nframes; i++)
+    {
+        frame_mask(i) = mask_bytes[i] != 0;
+    }
+
+    return true;
+}
+
+std::string database_default_frame_mask_path(const char* database_filename)
+{
+    std::string path(database_filename);
+    std::string::size_type slash = path.find_last_of("/\\");
+    if (slash == std::string::npos)
+    {
+        return "frame_mask.bin";
+    }
+    return path.substr(0, slash + 1) + "frame_mask.bin";
+}
+
+void database_finalize_loaded_mask(database& db)
+{
+    if (db.searchable_frames.size != db.nframes())
+    {
+        database_build_search_mask(db);
+        return;
+    }
+
+    float max_valid_speed = 0.0f;
+    for (int i = 0; i < db.nframes(); i++)
+    {
+        if (db.searchable_frames(i))
+        {
+            max_valid_speed = maxf(max_valid_speed, database_root_planar_speed(db, i));
+        }
+    }
+    db.root_speed_limit = max_valid_speed;
+}
+
 int database_find_first_searchable_frame(database& db, const int range_index = 0)
 {
     int start = db.range_starts(range_index);
@@ -160,6 +220,11 @@ int database_advance_frame(database& db, const int frame)
                 {
                     next++;
                 }
+
+                if (!db.searchable_frames(next))
+                {
+                    return frame;
+                }
             }
 
             return next;
@@ -188,7 +253,15 @@ void database_load(database& db, const char* filename)
     
     fclose(f);
 
-    database_build_search_mask(db);
+    if (!frame_mask_load(db.searchable_frames, database_default_frame_mask_path(filename).c_str()) ||
+        db.searchable_frames.size != db.nframes())
+    {
+        database_build_search_mask(db);
+    }
+    else
+    {
+        database_finalize_loaded_mask(db);
+    }
 }
 
 void database_save_matching_features(const database& db, const char* filename)
@@ -644,6 +717,102 @@ void compute_trajectory_direction_feature(database& db, int& offset, float weigh
     offset += 6;
 }
 
+void compute_phase_contact_feature(
+    database& db,
+    int& offset,
+    const float phase_weight = 1.0f,
+    const float contact_weight = 1.0f)
+{
+    array1d<float> phase(db.nframes());
+    phase.zero();
+
+    for (int r = 0; r < db.nranges(); r++)
+    {
+        int start = db.range_starts(r);
+        int stop = db.range_stops(r);
+
+        std::vector<int> event_frames;
+        std::vector<int> event_feet;
+
+        for (int i = start + 1; i < stop; i++)
+        {
+            for (int foot = 0; foot < db.ncontacts(); foot++)
+            {
+                if (!db.contact_states(i - 1, foot) && db.contact_states(i, foot))
+                {
+                    event_frames.push_back(i);
+                    event_feet.push_back(foot);
+                }
+            }
+        }
+
+        if (event_frames.size() < 2)
+        {
+            float denom = maxf((float)(stop - start - 1), 1.0f);
+            for (int i = start; i < stop; i++)
+            {
+                phase(i) = 2.0f * PIf * (float)(i - start) / denom;
+            }
+        }
+        else
+        {
+            std::vector<float> event_phase(event_frames.size());
+            float base_phase = event_feet[0] == 0 ? 0.0f : PIf;
+            for (int e = 0; e < (int)event_frames.size(); e++)
+            {
+                event_phase[e] = base_phase + e * PIf;
+            }
+
+            int first_frame = event_frames.front();
+            int second_frame = event_frames[1];
+            float first_span = maxf((float)(second_frame - first_frame), 1.0f);
+            for (int i = start; i < first_frame; i++)
+            {
+                float alpha = (float)(i - first_frame) / first_span;
+                phase(i) = event_phase[0] + alpha * PIf;
+            }
+
+            for (int e = 0; e < (int)event_frames.size() - 1; e++)
+            {
+                int frame0 = event_frames[e];
+                int frame1 = event_frames[e + 1];
+                float span = maxf((float)(frame1 - frame0), 1.0f);
+                for (int i = frame0; i < frame1; i++)
+                {
+                    float alpha = (float)(i - frame0) / span;
+                    phase(i) = lerpf(event_phase[e], event_phase[e + 1], alpha);
+                }
+            }
+
+            int last_idx = (int)event_frames.size() - 1;
+            int prev_frame = event_frames[last_idx - 1];
+            int last_frame = event_frames[last_idx];
+            float last_span = maxf((float)(last_frame - prev_frame), 1.0f);
+            for (int i = last_frame; i < stop; i++)
+            {
+                float alpha = (float)(i - last_frame) / last_span;
+                phase(i) = event_phase[last_idx] + alpha * PIf;
+            }
+        }
+    }
+
+    for (int i = 0; i < db.nframes(); i++)
+    {
+        db.features(i, offset + 0) = sinf(phase(i));
+        db.features(i, offset + 1) = cosf(phase(i));
+    }
+    normalize_feature(db.features, db.features_offset, db.features_scale, offset, 2, phase_weight);
+    offset += 2;
+
+    for (int i = 0; i < db.nframes(); i++)
+    {
+        db.features(i, offset + 0) = db.contact_states(i, 0) ? 1.0f : 0.0f;
+        db.features(i, offset + 1) = db.contact_states(i, 1) ? 1.0f : 0.0f;
+    }
+    normalize_feature(db.features, db.features_offset, db.features_scale, offset, 2, contact_weight);
+    offset += 2;
+}
+
 // Build the Motion Matching search acceleration structure. Here we
 // just use axis aligned bounding boxes regularly spaced at BOUND_SM_SIZE
 // and BOUND_LR_SIZE frames
@@ -701,6 +870,8 @@ void database_build_matching_features(
         3 + // Hip Velocity
         6 + // Trajectory Positions 2D
         6 + // Trajectory Directions 2D
+        2 + // Phase sin/cos
+        2 + // Contact state
         nenvironment_features;
         
     db.features.resize(db.nframes(), nfeatures);
@@ -715,6 +886,7 @@ void database_build_matching_features(
     compute_bone_velocity_feature(db, offset, Bone_Hips, feature_weight_hip_velocity);
     compute_trajectory_position_feature(db, offset, feature_weight_trajectory_positions);
     compute_trajectory_direction_feature(db, offset, feature_weight_trajectory_directions);
+    compute_phase_contact_feature(db, offset, 1.0f, 1.0f);
 
     if (nenvironment_features > 0)
     {
@@ -876,6 +1048,133 @@ void motion_matching_search(
     }
 }
 
+static inline void motion_matching_topk_insert(
+    slice1d<int> best_indices,
+    slice1d<float> best_costs,
+    const int index,
+    const float cost)
+{
+    if (best_indices.size == 0 || cost >= best_costs(best_costs.size - 1))
+    {
+        return;
+    }
+
+    int insert_pos = best_costs.size - 1;
+    while (insert_pos > 0 && cost < best_costs(insert_pos - 1))
+    {
+        best_costs(insert_pos) = best_costs(insert_pos - 1);
+        best_indices(insert_pos) = best_indices(insert_pos - 1);
+        insert_pos--;
+    }
+
+    best_costs(insert_pos) = cost;
+    best_indices(insert_pos) = index;
+}
+
+void motion_matching_search_topk(
+    slice1d<int> best_indices,
+    slice1d<float> best_costs,
+    const slice1d<int> range_starts,
+    const slice1d<int> range_stops,
+    const slice1d<bool> searchable_frames,
+    const slice2d<float> features,
+    const slice1d<float> query_normalized,
+    const slice2d<float> bound_sm_min,
+    const slice2d<float> bound_sm_max,
+    const slice2d<float> bound_lr_min,
+    const slice2d<float> bound_lr_max,
+    const int curr_index,
+    const float transition_cost = 0.0f,
+    const int ignore_range_end = 20,
+    const int ignore_surrounding = 20)
+{
+    best_indices.set(-1);
+    best_costs.set(FLT_MAX);
+
+    int nfeatures = query_normalized.size;
+    int nranges = range_starts.size;
+    float worst_cost = FLT_MAX;
+
+    for (int r = 0; r < nranges; r++)
+    {
+        int i = range_starts(r);
+        int range_end = range_stops(r) - ignore_range_end;
+
+        while (i < range_end)
+        {
+            int i_lr = i / BOUND_LR_SIZE;
+            int i_lr_next = (i_lr + 1) * BOUND_LR_SIZE;
+
+            float curr_cost = transition_cost;
+            for (int j = 0; j < nfeatures; j++)
+            {
+                curr_cost += squaref(query_normalized(j) - clampf(query_normalized(j), bound_lr_min(i_lr, j), bound_lr_max(i_lr, j)));
+                if (curr_cost >= worst_cost)
+                {
+                    break;
+                }
+            }
+
+            if (curr_cost >= worst_cost)
+            {
+                i = i_lr_next;
+                continue;
+            }
+
+            while (i < i_lr_next && i < range_end)
+            {
+                int i_sm = i / BOUND_SM_SIZE;
+                int i_sm_next = (i_sm + 1) * BOUND_SM_SIZE;
+
+                curr_cost = transition_cost;
+                for (int j = 0; j < nfeatures; j++)
+                {
+                    curr_cost += squaref(query_normalized(j) - clampf(query_normalized(j), bound_sm_min(i_sm, j), bound_sm_max(i_sm, j)));
+                    if (curr_cost >= worst_cost)
+                    {
+                        break;
+                    }
+                }
+
+                if (curr_cost >= worst_cost)
+                {
+                    i = i_sm_next;
+                    continue;
+                }
+
+                while (i < i_sm_next && i < range_end)
+                {
+                    if (searchable_frames.data != NULL && !searchable_frames(i))
+                    {
+                        i++;
+                        continue;
+                    }
+
+                    if (curr_index != -1 && abs(i - curr_index) < ignore_surrounding)
+                    {
+                        i++;
+                        continue;
+                    }
+
+                    curr_cost = transition_cost;
+                    for (int j = 0; j < nfeatures; j++)
+                    {
+                        curr_cost += squaref(query_normalized(j) - features(i, j));
+                        if (curr_cost >= worst_cost)
+                        {
+                            break;
+                        }
+                    }
+
+                    motion_matching_topk_insert(best_indices, best_costs, i, curr_cost);
+                    worst_cost = best_costs(best_costs.size - 1);
+                    i++;
+                }
+            }
+        }
+    }
+}
+
 // Search database
 void database_search(
     int& best_index, 
@@ -890,7 +1189,8 @@ void database_search(
     array1d<float> query_normalized(db.nfeatures());
     for (int i = 0; i < db.nfeatures(); i++)
     {
-        query_normalized(i) = (query(i) - db.features_offset(i)) / db.features_scale(i);
+        float feature_scale = fabsf(db.features_scale(i)) > 1e-8f ? db.features_scale(i) : 1.0f;
+        query_normalized(i) = (query(i) - db.features_offset(i)) / feature_scale;
     }
     
     // Search
@@ -908,6 +1208,41 @@ void database_search(
         db.bound_lr_min,
         db.bound_lr_max,
         query_normalized,
+        transition_cost,
+        ignore_range_end,
+        ignore_surrounding);
+}
+
+void database_search_topk(
+    slice1d<int> best_indices,
+    slice1d<float> best_costs,
+    const database& db,
+    const slice1d<float> query,
+    const int curr_index = -1,
+    const float transition_cost = 0.0f,
+    const int ignore_range_end = 20,
+    const int ignore_surrounding = 20)
+{
+    array1d<float> query_normalized(db.nfeatures());
+    for (int i = 0; i < db.nfeatures(); i++)
+    {
+        float feature_scale = fabsf(db.features_scale(i)) > 1e-8f ? db.features_scale(i) : 1.0f;
+        query_normalized(i) = (query(i) - db.features_offset(i)) / feature_scale;
+    }
+
+    motion_matching_search_topk(
+        best_indices,
+        best_costs,
+        db.range_starts,
+        db.range_stops,
+        db.searchable_frames,
+        db.features,
+        query_normalized,
+        db.bound_sm_min,
+        db.bound_sm_max,
+        db.bound_lr_min,
+        db.bound_lr_max,
+        curr_index,
         transition_cost,
         ignore_range_end,
         ignore_surrounding);

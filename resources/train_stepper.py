@@ -29,18 +29,30 @@ except ModuleNotFoundError:
         def close(self):
             pass
 
-from train_common import load_database, load_features, load_latent, save_network
+from train_common import (
+    build_valid_spans,
+    control_feature_slice,
+    default_frame_mask_path,
+    load_database,
+    load_features,
+    load_frame_mask,
+    load_latent,
+    sample_window_batch,
+    save_network,
+    save_valid_spans,
+    valid_window_starts,
+)
 
 # Networks
 
 class Stepper(nn.Module):
 
-    def __init__(self, input_size, hidden_size=512):
+    def __init__(self, input_size, output_size, hidden_size=512):
         super(Stepper, self).__init__()
         
         self.linear0 = nn.Linear(input_size, hidden_size)
         self.linear1 = nn.Linear(hidden_size, hidden_size)
-        self.linear2 = nn.Linear(hidden_size, input_size)
+        self.linear2 = nn.Linear(hidden_size, output_size)
 
     def forward(self, x):
         x = F.relu(self.linear0(x))
@@ -57,6 +69,8 @@ def parse_args():
     parser.add_argument('--niter', type=int, default=100000)
     parser.add_argument('--save-every', type=int, default=1000)
     parser.add_argument('--lr', type=float, default=0.001)
+    parser.add_argument('--frame-mask', default=None)
+    parser.add_argument('--valid-spans-out', default='stepper_valid_spans.json')
     return parser.parse_args()
 
 if __name__ == '__main__':
@@ -71,10 +85,12 @@ if __name__ == '__main__':
     
     X = load_features('./features.bin')['features'].copy().astype(np.float32)
     Z = load_latent('./latent.bin')['latent'].copy().astype(np.float32)
+    C = X[:, control_feature_slice(X.shape[1])].copy().astype(np.float32)
     
     nframes = X.shape[0]
     nfeatures = X.shape[1]
     nlatent = Z.shape[1]
+    ncontrol = C.shape[1]
     
     # Parameters
     
@@ -100,11 +116,22 @@ if __name__ == '__main__':
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
     print(f'Using device: {device}')
+
+    frame_mask_path = args.frame_mask or default_frame_mask_path('./database.bin')
+    frame_valid = load_frame_mask(frame_mask_path)
+    if frame_valid.shape[0] != nframes:
+        raise RuntimeError(f'frame mask size mismatch: {frame_valid.shape[0]} vs {nframes}')
+    spans = build_valid_spans(range_starts, range_stops, frame_valid)
+    valid_starts = valid_window_starts(spans, window)
+    if len(valid_starts) == 0:
+        raise RuntimeError('no valid stepper spans found')
+    save_valid_spans(args.valid_spans_out, spans)
     
     # Compute means/stds
     
     X_scale = X.std()
     Z_scale = Z.std()
+    C_scale = np.maximum(C.std(axis=0), 1e-8)
     
     stepper_mean_out = torch.as_tensor(np.hstack([
         ((X[1:] - X[:-1]) / dt).mean(axis=0).ravel(),
@@ -119,21 +146,24 @@ if __name__ == '__main__':
     stepper_mean_in = torch.as_tensor(np.hstack([
         X.mean(axis=0).ravel(),
         Z.mean(axis=0).ravel(),
+        C.mean(axis=0).ravel(),
     ]).astype(np.float32), device=device)
     
     stepper_std_in = torch.as_tensor(np.hstack([
         np.repeat(X_scale, nfeatures),
         np.repeat(Z_scale, nlatent),
+        C_scale,
     ]).astype(np.float32), device=device)
     
     # Make PyTorch tensors
     
     X = torch.as_tensor(X)
     Z = torch.as_tensor(Z)
+    C = torch.as_tensor(C)
     
     # Make networks
     
-    network_stepper = Stepper(nfeatures + nlatent).to(device)
+    network_stepper = Stepper(nfeatures + nlatent + ncontrol, nfeatures + nlatent).to(device)
     
     # Function to generate test predictions
     
@@ -144,11 +174,12 @@ if __name__ == '__main__':
             # Get slice of database for first clip
             
             preview_index = min(2, len(range_starts) - 1)
-            start = range_starts[preview_index]
-            stop = min(start + 1000, range_stops[preview_index])
+            start, stop = spans[min(preview_index, len(spans) - 1)]
+            stop = min(start + 1000, stop)
             
             Xgnd = X[start:stop][np.newaxis].to(device)
             Zgnd = Z[start:stop][np.newaxis].to(device)
+            Cgnd = C[start:stop][np.newaxis].to(device)
             
             # Predict, resetting every `window` frames
             
@@ -164,7 +195,7 @@ if __name__ == '__main__':
                     Xtil_prev = Xtil[:,i-1]
                     Ztil_prev = Ztil[:,i-1]
                 
-                output = (network_stepper((torch.cat([Xtil_prev, Ztil_prev], dim=-1) - 
+                output = (network_stepper((torch.cat([Xtil_prev, Ztil_prev, Cgnd[:,i-1]], dim=-1) - 
                     stepper_mean_in) / stepper_std_in) * 
                     stepper_std_out + stepper_mean_out)
                 
@@ -209,11 +240,6 @@ if __name__ == '__main__':
     
     # Build potential batches respecting window size
     
-    indices = []
-    for i in range(nframes - window):
-        indices.append(np.arange(i, i + window))
-    indices = torch.as_tensor(np.array(indices), dtype=torch.long)
-    
     # Train
     
     writer = SummaryWriter()
@@ -236,10 +262,11 @@ if __name__ == '__main__':
         
         # Extract batch
         
-        batch = indices[torch.randint(0, len(indices), size=[batchsize])]
+        batch = torch.as_tensor(sample_window_batch(valid_starts, window, batchsize), dtype=torch.long)
         
         Xgnd = X[batch].to(device)
         Zgnd = Z[batch].to(device)
+        Cgnd = C[batch].to(device)
         
         # Predict
         
@@ -248,7 +275,7 @@ if __name__ == '__main__':
         
         for _ in range(1, window):
             
-            output = (network_stepper((torch.cat([Xtil[-1], Ztil[-1]], dim=-1) - 
+            output = (network_stepper((torch.cat([Xtil[-1], Ztil[-1], Cgnd[:,len(Xtil)-1]], dim=-1) - 
                 stepper_mean_in) / stepper_std_in) * 
                 stepper_std_out + stepper_mean_out)
             

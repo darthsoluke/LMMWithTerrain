@@ -6,6 +6,30 @@
 #include "array.h"
 #include "nnet.h"
 
+bool latent_load(array2d<float>& latent, const char* filename)
+{
+    FILE* f = fopen(filename, "rb");
+    if (f == NULL)
+    {
+        return false;
+    }
+
+    int nframes = 0;
+    int nfeatures = 0;
+    fread(&nframes, sizeof(int), 1, f);
+    fread(&nfeatures, sizeof(int), 1, f);
+    if (nframes <= 0 || nfeatures <= 0)
+    {
+        fclose(f);
+        return false;
+    }
+
+    latent.resize(nframes, nfeatures);
+    fread(latent.data, sizeof(float), nframes * nfeatures, f);
+    fclose(f);
+    return true;
+}
+
 // This function uses the decompressor network
 // to generate the pose of the character. It 
 // requires as input the feature values and latent 
@@ -122,11 +146,89 @@ void decompressor_evaluate(
     assert(offset == nn.output_mean.size);
 }
 
+float selector_score_candidate(
+    nnet_evaluation& evaluation,
+    const slice1d<float> query_normalized,
+    const slice1d<float> curr_features,
+    const slice1d<float> candidate_features,
+    const float candidate_cost,
+    const nnet& nn)
+{
+    slice1d<float> input_layer = evaluation.layers.front();
+    int offset = 0;
+    for (int i = 0; i < query_normalized.size; i++)
+    {
+        input_layer(offset++) = query_normalized(i);
+    }
+    for (int i = 0; i < curr_features.size; i++)
+    {
+        input_layer(offset++) = curr_features(i);
+    }
+    for (int i = 0; i < candidate_features.size; i++)
+    {
+        input_layer(offset++) = candidate_features(i);
+    }
+    input_layer(offset++) = candidate_cost;
+    assert(offset == input_layer.size);
+
+    nnet_evaluate(evaluation, nn);
+    return evaluation.layers.back()(0);
+}
+
+void residual_stepper_evaluate(
+    slice1d<float> residual_features,
+    slice1d<float> residual_latent,
+    const slice1d<float> control,
+    const slice1d<float> anchor_features,
+    const slice1d<float> anchor_latent,
+    nnet_evaluation& evaluation,
+    const nnet& nn,
+    const float dt = 1.0f / 60.0f)
+{
+    slice1d<float> input_layer = evaluation.layers.front();
+    slice1d<float> output_layer = evaluation.layers.back();
+
+    int offset = 0;
+    for (int i = 0; i < residual_features.size; i++)
+    {
+        input_layer(offset++) = residual_features(i);
+    }
+    for (int i = 0; i < residual_latent.size; i++)
+    {
+        input_layer(offset++) = residual_latent(i);
+    }
+    for (int i = 0; i < control.size; i++)
+    {
+        input_layer(offset++) = control(i);
+    }
+    for (int i = 0; i < anchor_features.size; i++)
+    {
+        input_layer(offset++) = anchor_features(i);
+    }
+    for (int i = 0; i < anchor_latent.size; i++)
+    {
+        input_layer(offset++) = anchor_latent(i);
+    }
+    assert(offset == input_layer.size);
+
+    nnet_evaluate(evaluation, nn);
+
+    for (int i = 0; i < residual_features.size; i++)
+    {
+        residual_features(i) += dt * output_layer(i);
+    }
+    for (int i = 0; i < residual_latent.size; i++)
+    {
+        residual_latent(i) += dt * output_layer(residual_features.size + i);
+    }
+}
+
 // This function updates the feature and latent values
 // using the stepper network and a given dt.
 void stepper_evaluate(
     slice1d<float> features,
     slice1d<float> latent,
+    const slice1d<float> control,
     nnet_evaluation& evaluation,
     const nnet& nn,
     const float dt = 1.0f / 60.0f)
@@ -144,6 +246,11 @@ void stepper_evaluate(
     for (int i = 0; i < latent.size; i++)
     {
         input_layer(features.size + i) = latent(i);
+    }
+
+    for (int i = 0; i < control.size; i++)
+    {
+        input_layer(features.size + latent.size + i) = control(i);
     }
     
     // Evaluate network
@@ -190,7 +297,8 @@ void projector_evaluate(
     
     for (int i = 0; i < query.size; i++)
     {
-        input_layer(i) = (query(i) - features_offset(i)) / features_scale(i);      
+        float feature_scale = fabsf(features_scale(i)) > 1e-8f ? features_scale(i) : 1.0f;
+        input_layer(i) = (query(i) - features_offset(i)) / feature_scale;      
     }
     
     // Evaluate network

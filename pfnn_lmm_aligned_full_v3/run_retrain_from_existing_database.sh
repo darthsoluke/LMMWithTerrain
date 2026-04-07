@@ -3,7 +3,6 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 MM_ROOT="$(cd "$ROOT/.." && pwd)"
-PFNN_ROOT="$(cd "$MM_ROOT/../PFNN" && pwd)"
 RES="$ROOT/resources"
 LOG="$ROOT/logs"
 BASE="$MM_ROOT/resources"
@@ -18,38 +17,25 @@ PROJECTOR_NN_CHUNK="${PROJECTOR_NN_CHUNK:-65536}"
 TERRAIN_CONFIG="$BASE/terrain_sampling_config.txt"
 
 mkdir -p "$RES" "$LOG"
-rm -f "$LOG"/*.log "$LOG"/*.done
+rm -f "$LOG"/generate_environment.log "$LOG"/build_features.log "$LOG"/feature_headers.log \
+      "$LOG"/frame_audit.log "$LOG"/decompressor.log "$LOG"/stepper.log "$LOG"/projector.log \
+      "$LOG"/retrain_existing.done "$LOG"/retrain_existing.log
 
-if [ ! -x "$PYTHON_BIN" ]; then
-  echo "Missing python executable at $PYTHON_BIN" >&2
+if [ ! -f "$RES/database.bin" ]; then
+  echo "Missing existing database at $RES/database.bin" >&2
   exit 1
 fi
 
-if [ ! -x "$BUILD_FEATURES" ]; then
-  echo "Missing build_features executable at $BUILD_FEATURES" >&2
-  exit 1
-fi
+echo "PYTHON_BIN=$PYTHON_BIN" > "$LOG/retrain_existing.log"
+echo "NITER=$NITER SAVE_EVERY=$SAVE_EVERY" >> "$LOG/retrain_existing.log"
+echo "DECOMP_GPU=$DECOMP_GPU STEPPER_GPU=$STEPPER_GPU PROJECTOR_GPU=$PROJECTOR_GPU" >> "$LOG/retrain_existing.log"
 
-echo "PYTHON_BIN=$PYTHON_BIN" > "$LOG/pipeline.log"
-echo "NITER=$NITER SAVE_EVERY=$SAVE_EVERY" >> "$LOG/pipeline.log"
-echo "DECOMP_GPU=$DECOMP_GPU STEPPER_GPU=$STEPPER_GPU PROJECTOR_GPU=$PROJECTOR_GPU" >> "$LOG/pipeline.log"
-echo "TERRAIN_CONFIG=$TERRAIN_CONFIG" >> "$LOG/pipeline.log"
-
-echo "[1/6] Exporting aligned PFNN database..." | tee -a "$LOG/pipeline.log"
-(
-  cd "$PFNN_ROOT"
-  "$PYTHON_BIN" -u "$PFNN_ROOT/export_lmm_database.py" --output-dir "$RES" --terrain-config "$TERRAIN_CONFIG"
-) \
-  > "$LOG/export.log" 2>&1
-touch "$LOG/export.done"
-
-echo "[2/6] Linking training scripts..." | tee -a "$LOG/pipeline.log"
 for name in bvh.py quat.py tquat.py txform.py train_common.py train_decompressor.py train_stepper.py train_projector.py terrain_sampling_config.txt; do
   rm -f "$RES/$name"
   ln -s "$BASE/$name" "$RES/$name"
 done
 
-echo "[3/6] Generating terrain+SDF environment features..." | tee -a "$LOG/pipeline.log"
+echo "[1/5] Generating terrain+SDF environment features..." | tee -a "$LOG/retrain_existing.log"
 "$PYTHON_BIN" -u "$BASE/generate_terrain_assets.py" \
   --database "$RES/database.bin" \
   --output-dir "$RES" \
@@ -57,7 +43,7 @@ echo "[3/6] Generating terrain+SDF environment features..." | tee -a "$LOG/pipel
   --terrain-config "$TERRAIN_CONFIG" \
   > "$LOG/generate_environment.log" 2>&1
 
-echo "[4/6] Building 57D matching features..." | tee -a "$LOG/pipeline.log"
+echo "[2/5] Building 57D matching features..." | tee -a "$LOG/retrain_existing.log"
 "$BUILD_FEATURES" "$RES/database.bin" "$RES/terrain_features.bin" "$RES/features.bin" \
   > "$LOG/build_features.log" 2>&1
 
@@ -73,7 +59,7 @@ for rel in ("database.bin", "terrain_features.bin", "features.bin"):
         print(rel, struct.unpack("II", f.read(8)))
 PY
 
-echo "[5/6] Auditing frames and building invalid-frame mask..." | tee -a "$LOG/pipeline.log"
+echo "[3/5] Auditing frames and building invalid-frame mask..." | tee -a "$LOG/retrain_existing.log"
 "$PYTHON_BIN" -u "$BASE/audit_database_frames.py" \
   --database "$RES/database.bin" \
   --features "$RES/features.bin" \
@@ -81,9 +67,8 @@ echo "[5/6] Auditing frames and building invalid-frame mask..." | tee -a "$LOG/p
   --output-dir "$RES" \
   > "$LOG/frame_audit.log" 2>&1
 
-echo "[6/6] Training Learned Motion Matching networks..." | tee -a "$LOG/pipeline.log"
+echo "[4/5] Training decompressor..." | tee -a "$LOG/retrain_existing.log"
 cd "$RES"
-
 CUDA_VISIBLE_DEVICES="$DECOMP_GPU" "$PYTHON_BIN" -u ./train_decompressor.py \
   --device cuda:0 \
   --batchsize 32 \
@@ -94,6 +79,7 @@ CUDA_VISIBLE_DEVICES="$DECOMP_GPU" "$PYTHON_BIN" -u ./train_decompressor.py \
   --terrain-grid ./pfnn_terrain_rocky_grid.bin \
   > "$LOG/decompressor.log" 2>&1
 
+echo "[5/5] Training stepper + projector..." | tee -a "$LOG/retrain_existing.log"
 CUDA_VISIBLE_DEVICES="$STEPPER_GPU" "$PYTHON_BIN" -u ./train_stepper.py \
   --device cuda:0 \
   --batchsize 64 \
@@ -117,5 +103,5 @@ PROJECTOR_PID=$!
 
 wait "$STEPPER_PID"
 wait "$PROJECTOR_PID"
-touch "$LOG/pipeline.done"
-echo "done" | tee -a "$LOG/pipeline.log"
+touch "$LOG/retrain_existing.done"
+echo "done" | tee -a "$LOG/retrain_existing.log"

@@ -4,6 +4,8 @@ from pathlib import Path
 
 import numpy as np
 
+from terrain_config import load_terrain_config
+
 
 LMM_TO_METERS = 5.6444 / 100.0
 PFNN_HEIGHTMAP_HSCALE = 3.937007874 * LMM_TO_METERS
@@ -11,9 +13,6 @@ PFNN_HEIGHTMAP_VSCALE = 3.0 * LMM_TO_METERS
 PFNN_HEIGHTMAP_PATH = Path(__file__).resolve().parents[2] / "PFNN" / "demo" / "heightmaps" / "hmap_007_smooth.txt"
 PFNN_HEIGHTMAP_ORIGIN_X = -320.0 * LMM_TO_METERS
 PFNN_HEIGHTMAP_ORIGIN_Z = 680.0 * LMM_TO_METERS
-TERRAIN_FUTURE_FRAMES = (20, 40, 60)
-TERRAIN_STRIP_HALF_WIDTH = 0.25
-OBSTACLE_SDF_CLAMP_DISTANCE = 2.5
 GRID_RESOLUTION_X = 240
 GRID_RESOLUTION_Z = 240
 DEFAULT_ENVIRONMENT_BOXES = [
@@ -67,6 +66,14 @@ def clamp_index(range_starts, range_stops, frame, offset):
         if start <= frame < stop:
             return np.clip(frame + offset, start, stop - 1)
     raise RuntimeError(f"frame {frame} not found in any range")
+
+
+def build_future_indices(range_starts, range_stops, offset, nframes):
+    indices = np.zeros(nframes, dtype=np.int32)
+    for start, stop in zip(range_starts, range_stops):
+        frames = np.arange(start, stop, dtype=np.int32)
+        indices[start:stop] = np.clip(frames + offset, start, stop - 1)
+    return indices
 
 
 def quat_mul_vec(q, v):
@@ -155,8 +162,8 @@ def box_signed_distance_xz(sample_points, box):
     return outside + inside
 
 
-def sample_obstacle_sdf(sample_points, boxes):
-    sdf = np.full(sample_points.shape[0], OBSTACLE_SDF_CLAMP_DISTANCE, dtype=np.float32)
+def sample_obstacle_sdf(sample_points, boxes, clamp_distance):
+    sdf = np.full(sample_points.shape[0], clamp_distance, dtype=np.float32)
     found_obstacle = False
 
     for box in boxes:
@@ -169,7 +176,7 @@ def sample_obstacle_sdf(sample_points, boxes):
     if not found_obstacle:
         return sdf
 
-    return np.clip(sdf, -OBSTACLE_SDF_CLAMP_DISTANCE, OBSTACLE_SDF_CLAMP_DISTANCE)
+    return np.clip(sdf, -clamp_distance, clamp_distance)
 
 
 def write_feature_file(features, output_path):
@@ -178,41 +185,46 @@ def write_feature_file(features, output_path):
         f.write(features.astype(np.float32).tobytes())
 
 
-def export_environment_features(db, terr_func, boxes, output_path, include_obstacle_sdf=True):
+def export_environment_features(db, terr_func, boxes, output_path, config, include_obstacle_sdf=True):
     root_positions = db["bone_positions"][:, 0]
     root_rotations = db["bone_rotations"][:, 0]
     range_starts = db["range_starts"]
     range_stops = db["range_stops"]
 
     nframes = root_positions.shape[0]
-    nterrain_features = len(TERRAIN_FUTURE_FRAMES) * 3
+    nterrain_features = len(config.environment_horizons) * 3
     nsdf_features = nterrain_features if include_obstacle_sdf else 0
     environment = np.zeros((nframes, nterrain_features + nsdf_features), dtype=np.float32)
+    root_heights = terr_func.sample(root_positions[:, 0], root_positions[:, 2])
 
-    for i in range(nframes):
-        root_height = terr_func.sample(root_positions[i, 0], root_positions[i, 2])
-        terrain_cursor = 0
-        sdf_cursor = nterrain_features
+    terrain_cursor = 0
+    sdf_cursor = nterrain_features
 
-        for future_offset in TERRAIN_FUTURE_FRAMES:
-            t = clamp_index(range_starts, range_stops, i, future_offset)
-            center = root_positions[t]
-            right = quat_mul_vec(root_rotations[t], np.array([1.0, 0.0, 0.0], dtype=np.float32))
+    for future_offset in config.environment_horizons:
+        future_indices = build_future_indices(range_starts, range_stops, future_offset, nframes)
+        center = root_positions[future_indices]
+        right = quat_mul_vec(root_rotations[future_indices], np.array([1.0, 0.0, 0.0], dtype=np.float32))
 
-            samples = (
-                center + TERRAIN_STRIP_HALF_WIDTH * right,
-                center,
-                center - TERRAIN_STRIP_HALF_WIDTH * right,
-            )
-            sample_points = np.asarray([[sample[0], sample[2]] for sample in samples], dtype=np.float32)
+        sample_right = center + config.strip_half_width * right
+        sample_center = center
+        sample_left = center - config.strip_half_width * right
 
-            for sample in samples:
-                environment[i, terrain_cursor] = terr_func.sample(sample[0], sample[2]) - root_height
-                terrain_cursor += 1
+        flat_x = np.concatenate([sample_right[:, 0], sample_center[:, 0], sample_left[:, 0]])
+        flat_z = np.concatenate([sample_right[:, 2], sample_center[:, 2], sample_left[:, 2]])
+        flat_heights = terr_func.sample(flat_x, flat_z)
+        flat_heights = flat_heights.reshape(3, nframes).transpose(1, 0) - root_heights[:, None]
+        environment[:, terrain_cursor:terrain_cursor + 3] = flat_heights
+        terrain_cursor += 3
 
-            if include_obstacle_sdf:
-                environment[i, sdf_cursor:sdf_cursor + 3] = sample_obstacle_sdf(sample_points, boxes)
-                sdf_cursor += 3
+        if include_obstacle_sdf:
+            flat_points = np.concatenate([
+                np.stack([sample_right[:, 0], sample_right[:, 2]], axis=1),
+                np.stack([sample_center[:, 0], sample_center[:, 2]], axis=1),
+                np.stack([sample_left[:, 0], sample_left[:, 2]], axis=1),
+            ], axis=0)
+            flat_sdf = sample_obstacle_sdf(flat_points, boxes, config.sdf_clamp_distance)
+            environment[:, sdf_cursor:sdf_cursor + 3] = flat_sdf.reshape(3, nframes).transpose(1, 0)
+            sdf_cursor += 3
 
     write_feature_file(environment, output_path)
 
@@ -244,6 +256,7 @@ def parse_args():
     parser.add_argument("--output-dir", type=Path, default=resources_dir)
     parser.add_argument("--boxes-file", type=Path, default=resources_dir / "environment_boxes.txt")
     parser.add_argument("--heightmap-path", type=Path, default=PFNN_HEIGHTMAP_PATH)
+    parser.add_argument("--terrain-config", type=Path, default=resources_dir / "terrain_sampling_config.txt")
     parser.add_argument(
         "--export-rocky-features",
         action="store_true",
@@ -255,6 +268,7 @@ def parse_args():
 def main():
     args = parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    config = load_terrain_config(args.terrain_config)
 
     db = load_database(args.database)
     terr_func = PFNNTerrainFunction(
@@ -266,7 +280,7 @@ def main():
     )
     boxes = load_environment_boxes(args.boxes_file)
 
-    export_environment_features(db, terr_func, boxes, args.output_dir / "terrain_features.bin", include_obstacle_sdf=True)
+    export_environment_features(db, terr_func, boxes, args.output_dir / "terrain_features.bin", config, include_obstacle_sdf=True)
     export_render_grid(terr_func, args.output_dir / "pfnn_terrain_rocky_grid.bin")
     write_environment_boxes(boxes, args.output_dir / "environment_boxes.txt")
 
@@ -276,6 +290,7 @@ def main():
             terr_func,
             boxes,
             args.output_dir / "terrain_features_rocky.bin",
+            config,
             include_obstacle_sdf=False,
         )
 

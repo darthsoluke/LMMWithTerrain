@@ -1,0 +1,80 @@
+{
+  "teacher_teacher": {
+    "uphill": {
+      "frame0_slip": 0.0,
+      "frame1_slip": 8.106843,
+      "frame0_contact_height_error": 0.0,
+      "frame1_contact_height_error": 0.0,
+      "max_startup_slip_0_11": 42.734489,
+      "first_divergence_frame": null
+    },
+    "downhill": {
+      "frame0_slip": 0.0,
+      "frame1_slip": 8.30049,
+      "frame0_contact_height_error": 0.0,
+      "frame1_contact_height_error": 0.0,
+      "max_startup_slip_0_11": 49.37883,
+      "first_divergence_frame": null
+    },
+    "rough": {
+      "frame0_slip": 0.0,
+      "frame1_slip": 8.05714,
+      "frame0_contact_height_error": 0.0,
+      "frame1_contact_height_error": 3.2e-05,
+      "max_startup_slip_0_11": 17.868414,
+      "first_divergence_frame": null
+    }
+  },
+  "learned_zero": {
+    "uphill": {
+      "frame0_slip": 0.0,
+      "frame1_slip": 8.106843,
+      "frame0_contact_height_error": 0.0,
+      "frame1_contact_height_error": 0.0,
+      "max_startup_slip_0_11": 42.734489,
+      "first_divergence_frame": null
+    },
+    "downhill": {
+      "frame0_slip": 0.0,
+      "frame1_slip": 8.30049,
+      "frame0_contact_height_error": 0.0,
+      "frame1_contact_height_error": 0.0,
+      "max_startup_slip_0_11": 49.37883,
+      "first_divergence_frame": null
+    },
+    "rough": {
+      "frame0_slip": 0.0,
+      "frame1_slip": 8.05714,
+      "frame0_contact_height_error": 0.0,
+      "frame1_contact_height_error": 3.2e-05,
+      "max_startup_slip_0_11": 17.868414,
+      "first_divergence_frame": null
+    }
+  },
+  "learned_learned": {
+    "uphill": {
+      "frame0_slip": 0.0,
+      "frame1_slip": 8.608826,
+      "frame0_contact_height_error": 0.0,
+      "frame1_contact_height_error": 0.0,
+      "max_startup_slip_0_11": 47.517258,
+      "first_divergence_frame": null
+    },
+    "downhill": {
+      "frame0_slip": 0.0,
+      "frame1_slip": 8.571125,
+      "frame0_contact_height_error": 0.0,
+      "frame1_contact_height_error": 0.0,
+      "max_startup_slip_0_11": 49.207386,
+      "first_divergence_frame": null
+    },
+    "rough": {
+      "frame0_slip": 0.0,
+      "frame1_slip": 8.318795,
+      "frame0_contact_height_error": 0.0,
+      "frame1_contact_height_error": 0.0,
+      "max_startup_slip_0_11": 16.723869,
+      "first_divergence_frame": null
+    }
+  }
+}

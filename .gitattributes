@@ -1,3 +1,4 @@
 resources/*.bin filter=lfs diff=lfs merge=lfs -text
 lafan01/*.bin filter=lfs diff=lfs merge=lfs -text
 pfnn_lmm_aligned_full_v3/resources/*.bin filter=lfs diff=lfs merge=lfs -text
+pfnn_lmm_hybrid_full_v1/resources/*.bin filter=lfs diff=lfs merge=lfs -text

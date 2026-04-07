@@ -31,7 +31,18 @@ except ModuleNotFoundError:
 
 from sklearn.neighbors import BallTree
 
-from train_common import load_database, load_features, load_latent, save_network
+from train_common import (
+    default_frame_mask_path,
+    environment_feature_slice,
+    feature_group_weights,
+    hard_mining_scores,
+    load_database,
+    load_features,
+    load_frame_mask,
+    load_latent,
+    save_network,
+    valid_frame_indices,
+)
 
 # Networks
 
@@ -64,6 +75,11 @@ def parse_args():
     parser.add_argument('--save-every', type=int, default=1000)
     parser.add_argument('--lr', type=float, default=0.001)
     parser.add_argument('--nn-chunk', type=int, default=65536)
+    parser.add_argument('--frame-mask', default=None)
+    parser.add_argument('--hard-mine-frac', type=float, default=0.5)
+    parser.add_argument('--hard-mine-quantile', type=float, default=0.9)
+    parser.add_argument('--environment-weight', type=float, default=2.5)
+    parser.add_argument('--hard-mining-out', default='projector_hard_mining.json')
     return parser.parse_args()
 
 if __name__ == '__main__':
@@ -105,6 +121,14 @@ if __name__ == '__main__':
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
     print(f'Using device: {device}')
+
+    frame_mask_path = args.frame_mask or default_frame_mask_path('./database.bin')
+    frame_valid = load_frame_mask(frame_mask_path)
+    if frame_valid.shape[0] != nframes:
+        raise RuntimeError(f'frame mask size mismatch: {frame_valid.shape[0]} vs {nframes}')
+    valid_indices = valid_frame_indices(frame_valid)
+    if len(valid_indices) == 0:
+        raise RuntimeError('no valid frames for projector training')
     
     # Fit acceleration structure for nearest neighbors search
 
@@ -121,6 +145,24 @@ if __name__ == '__main__':
     
     X_scale = X.std()
     X_noise_std = X.std(axis=0) + 1.0
+    feature_weights_np = feature_group_weights(nfeatures, environment_weight=args.environment_weight)
+    feature_weights = torch.as_tensor(feature_weights_np, device=device)
+    env_slice = environment_feature_slice(nfeatures)
+    env_dim = env_slice.stop - env_slice.start
+    hard_scores = hard_mining_scores(X)
+    hard_threshold = float(np.quantile(hard_scores[valid_indices], args.hard_mine_quantile))
+    hard_indices = valid_indices[hard_scores[valid_indices] >= hard_threshold]
+    if len(hard_indices) == 0:
+        hard_indices = valid_indices
+    with open(args.hard_mining_out, 'w') as f:
+        import json
+        json.dump({
+            'valid_frames': int(len(valid_indices)),
+            'hard_frames': int(len(hard_indices)),
+            'hard_threshold': hard_threshold,
+            'hard_mine_frac': float(args.hard_mine_frac),
+            'environment_weight': float(args.environment_weight),
+        }, f, indent=2)
     
     projector_mean_out = torch.as_tensor(np.hstack([
         X.mean(axis=0).ravel(),
@@ -258,7 +300,13 @@ if __name__ == '__main__':
         
         # Extract batch
         
-        samples = np.random.randint(0, nframes, size=[batchsize])
+        hard_count = min(int(round(batchsize * args.hard_mine_frac)), batchsize)
+        base_count = batchsize - hard_count
+        samples = np.empty(batchsize, dtype=np.int64)
+        if base_count > 0:
+            samples[:base_count] = np.random.choice(valid_indices, size=[base_count], replace=True)
+        if hard_count > 0:
+            samples[base_count:] = np.random.choice(hard_indices, size=[hard_count], replace=True)
         
         nsigma = np.random.uniform(size=[batchsize, 1]).astype(np.float32)
         noise = np.random.normal(size=[batchsize, nfeatures]).astype(np.float32)
@@ -284,10 +332,12 @@ if __name__ == '__main__':
         
         # Compute Losses
         
-        loss_xval = torch.mean(1.0 * torch.abs(Xgnd - Xtil))
+        weighted_abs = torch.abs(Xgnd - Xtil) * feature_weights[None, :]
+        loss_xval = torch.mean(weighted_abs)
         loss_zval = torch.mean(5.0 * torch.abs(Zgnd - Ztil))
         loss_dist = torch.mean(0.3 * torch.abs(Dgnd - Dtil))
-        loss = loss_xval + loss_zval + loss_dist
+        loss_env = torch.mean(3.0 * torch.abs(Xgnd[:,env_slice] - Xtil[:,env_slice])) if env_dim > 0 else torch.zeros([], device=device)
+        loss = loss_xval + loss_zval + loss_dist + loss_env
         
         # Backprop
         
@@ -303,6 +353,7 @@ if __name__ == '__main__':
             'xval': loss_xval.item(),
             'zval': loss_zval.item(),
             'dist': loss_dist.item(),
+            'environment': loss_env.item(),
         }, i)
         
         if rolling_loss is None:
