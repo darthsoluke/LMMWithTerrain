@@ -38,6 +38,20 @@ static inline float planar_speed(vec3 v)
     return length(planar_velocity(v));
 }
 
+static inline float yaw_from_quat(quat q)
+{
+    vec3 fwd = quat_mul_vec3(q, vec3(0.0f, 0.0f, 1.0f));
+    return atan2f(fwd.x, fwd.z);
+}
+
+static inline float angle_diff(float a, float b)
+{
+    float d = a - b;
+    while (d > PIf) d -= 2.0f * PIf;
+    while (d < -PIf) d += 2.0f * PIf;
+    return d;
+}
+
 static inline vec3 clamp_planar_speed(vec3 v, float max_speed, const float eps = 1e-4f)
 {
     vec3 planar = planar_velocity(v);
@@ -191,6 +205,16 @@ struct eval_config_cpp
 static eval_config_cpp g_eval_config;
 static std::vector<eval_input_sample> g_eval_script;
 
+struct runtime_capture_config_cpp
+{
+    bool enabled = false;
+    std::string trace_path;
+    std::string tag = "interactive";
+    std::string failure_dump_dir;
+};
+
+static runtime_capture_config_cpp g_capture_config;
+
 struct runtime_debug_snapshot
 {
     int frame = 0;
@@ -212,14 +236,38 @@ struct runtime_debug_snapshot
     float stepper_output_norm = 0.0f;
     float decompressor_input_norm = 0.0f;
     float root_planar_speed = 0.0f;
+    float desired_speed = 0.0f;
+    float simulation_distance = 0.0f;
+    float root_yaw = 0.0f;
+    float simulation_yaw = 0.0f;
+    float desired_yaw = 0.0f;
+    float yaw_error = 0.0f;
+    float root_angular_speed_y = 0.0f;
+    float simulation_angular_speed_y = 0.0f;
     float contact_slip = 0.0f;
+    float contact_height_error = 0.0f;
+    float penetration_ratio = 0.0f;
+    int terrain_penetrations = 0;
     float correction_magnitude = 0.0f;
+    float root_adjust_position_delta = 0.0f;
+    float root_adjust_rotation_delta = 0.0f;
+    int root_adjust_count = 0;
     float switch_severity = 0.0f;
     float residual_carry_alpha = 1.0f;
     float selector_margin = 0.0f;
     int exemplar_dwell_frames = 0;
+    int hard_reset_cooldown = 0;
+    int penetration_streak = 0;
+    bool severe_runtime_penetration = false;
     bool emergency_reanchor = false;
     bool hard_reset = false;
+    bool learned_pose_transition = false;
+    bool switch_blocked_yaw = false;
+    bool switch_blocked_cooldown = false;
+    float left_contact_target_step = 0.0f;
+    float right_contact_target_step = 0.0f;
+    float left_contact_position_step = 0.0f;
+    float right_contact_position_step = 0.0f;
     std::vector<int> topk_indices;
     std::vector<float> topk_costs;
     std::vector<float> selector_scores;
@@ -284,6 +332,12 @@ static const int HYBRID_SELECTOR_MIN_DWELL_FRAMES = 6;
 static const float HYBRID_SELECTOR_SCORE_MARGIN = 4096.0f;
 static const float HYBRID_CONTACT_SLIP_GUARD = 10.0f;
 static const float HYBRID_CONTACT_SLIP_HARD_RESET = 25.0f;
+static const float HYBRID_RUNTIME_PENETRATION_RATIO_GUARD = 0.5f;
+static const float HYBRID_RUNTIME_PENETRATION_HEIGHT_GUARD = 0.02f;
+static const int HYBRID_RUNTIME_PENETRATION_STREAK_FRAMES = 4;
+static const int HYBRID_RUNTIME_REANCHOR_COOLDOWN_FRAMES = 12;
+static const int HYBRID_HARD_RESET_COOLDOWN_FRAMES = 8;
+static const float HYBRID_YAW_SWITCH_FREEZE = 0.75f;
 static const int STARTUP_BOOTSTRAP_WINDOW_FRAMES = 8;
 static const float STARTUP_SEVERE_PENETRATION = 0.05f;
 
@@ -535,6 +589,19 @@ static bool vec3_array_is_finite(const slice1d<vec3> values)
     return true;
 }
 
+static bool quat_array_is_finite(const slice1d<quat> values)
+{
+    for (int i = 0; i < values.size; i++)
+    {
+        if (!isfinite(values(i).w) || !isfinite(values(i).x) ||
+            !isfinite(values(i).y) || !isfinite(values(i).z))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
 static std::vector<float> copy_array(const slice1d<float> values)
 {
     std::vector<float> out(values.size);
@@ -582,8 +649,15 @@ static void write_runtime_snapshot(FILE* f, const runtime_debug_snapshot& snapsh
         "frame=%d teacher_frame=%d selected_exemplar=%d exemplar_valid=%d switch=%d divergence=%d "
         "finite_query=%d finite_features=%d finite_latent=%d finite_residual=%d finite_stepper=%d finite_decompressor=%d finite_pose=%d "
         "residual_norm_before=%.9g residual_norm_after=%.9g stepper_input_norm=%.9g stepper_output_norm=%.9g "
-        "decompressor_input_norm=%.9g root_planar_speed=%.9g contact_slip=%.9g correction_magnitude=%.9g "
-        "switch_severity=%.9g residual_carry_alpha=%.9g selector_margin=%.9g exemplar_dwell_frames=%d emergency_reanchor=%d hard_reset=%d\n",
+        "decompressor_input_norm=%.9g root_planar_speed=%.9g desired_speed=%.9g simulation_distance=%.9g "
+        "root_yaw=%.9g simulation_yaw=%.9g desired_yaw=%.9g yaw_error=%.9g "
+        "root_angular_speed_y=%.9g simulation_angular_speed_y=%.9g contact_slip=%.9g contact_height_error=%.9g "
+        "penetration_ratio=%.9g terrain_penetrations=%d correction_magnitude=%.9g "
+        "root_adjust_position_delta=%.9g root_adjust_rotation_delta=%.9g root_adjust_count=%d "
+        "switch_severity=%.9g residual_carry_alpha=%.9g selector_margin=%.9g exemplar_dwell_frames=%d "
+        "hard_reset_cooldown=%d penetration_streak=%d severe_runtime_penetration=%d "
+        "emergency_reanchor=%d hard_reset=%d learned_pose_transition=%d switch_blocked_yaw=%d switch_blocked_cooldown=%d "
+        "left_contact_target_step=%.9g right_contact_target_step=%.9g left_contact_position_step=%.9g right_contact_position_step=%.9g\n",
         snapshot.frame,
         snapshot.teacher_frame,
         snapshot.selected_exemplar,
@@ -603,14 +677,38 @@ static void write_runtime_snapshot(FILE* f, const runtime_debug_snapshot& snapsh
         snapshot.stepper_output_norm,
         snapshot.decompressor_input_norm,
         snapshot.root_planar_speed,
+        snapshot.desired_speed,
+        snapshot.simulation_distance,
+        snapshot.root_yaw,
+        snapshot.simulation_yaw,
+        snapshot.desired_yaw,
+        snapshot.yaw_error,
+        snapshot.root_angular_speed_y,
+        snapshot.simulation_angular_speed_y,
         snapshot.contact_slip,
+        snapshot.contact_height_error,
+        snapshot.penetration_ratio,
+        snapshot.terrain_penetrations,
         snapshot.correction_magnitude,
+        snapshot.root_adjust_position_delta,
+        snapshot.root_adjust_rotation_delta,
+        snapshot.root_adjust_count,
         snapshot.switch_severity,
         snapshot.residual_carry_alpha,
         snapshot.selector_margin,
         snapshot.exemplar_dwell_frames,
+        snapshot.hard_reset_cooldown,
+        snapshot.penetration_streak,
+        snapshot.severe_runtime_penetration ? 1 : 0,
         snapshot.emergency_reanchor ? 1 : 0,
-        snapshot.hard_reset ? 1 : 0);
+        snapshot.hard_reset ? 1 : 0,
+        snapshot.learned_pose_transition ? 1 : 0,
+        snapshot.switch_blocked_yaw ? 1 : 0,
+        snapshot.switch_blocked_cooldown ? 1 : 0,
+        snapshot.left_contact_target_step,
+        snapshot.right_contact_target_step,
+        snapshot.left_contact_position_step,
+        snapshot.right_contact_position_step);
 
     write_debug_vector_int(f, "topk_indices", snapshot.topk_indices);
     write_debug_vector(f, "topk_costs", snapshot.topk_costs);
@@ -706,6 +804,21 @@ static bool eval_parse_args(int argc, char** argv)
         else if (arg == "--failure-dump-dir")
         {
             g_eval_config.failure_dump_dir = require_value("--failure-dump-dir");
+        }
+        else if (arg == "--capture-trace")
+        {
+            g_capture_config.enabled = true;
+            g_capture_config.trace_path = require_value("--capture-trace");
+        }
+        else if (arg == "--capture-tag")
+        {
+            g_capture_config.enabled = true;
+            g_capture_config.tag = require_value("--capture-tag");
+        }
+        else if (arg == "--capture-failure-dump-dir")
+        {
+            g_capture_config.enabled = true;
+            g_capture_config.failure_dump_dir = require_value("--capture-failure-dump-dir");
         }
         else if (arg == "--eval-start-x")
         {
@@ -1576,6 +1689,89 @@ void query_copy_denormalized_feature(
     }
     
     offset += size;
+}
+
+void query_compute_bone_position_feature_live(
+    slice1d<float> query,
+    int& offset,
+    const int bone,
+    const slice1d<vec3> bone_positions,
+    const slice1d<quat> bone_rotations,
+    const slice1d<int> bone_parents)
+{
+    vec3 bone_position;
+    quat bone_rotation;
+
+    forward_kinematics(
+        bone_position,
+        bone_rotation,
+        bone_positions,
+        bone_rotations,
+        bone_parents,
+        bone);
+
+    bone_position = quat_mul_vec3(quat_inv(bone_rotations(0)), bone_position - bone_positions(0));
+
+    query(offset + 0) = bone_position.x;
+    query(offset + 1) = bone_position.y;
+    query(offset + 2) = bone_position.z;
+
+    offset += 3;
+}
+
+void query_compute_bone_velocity_feature_live(
+    slice1d<float> query,
+    int& offset,
+    const int bone,
+    const slice1d<vec3> bone_positions,
+    const slice1d<vec3> bone_velocities,
+    const slice1d<quat> bone_rotations,
+    const slice1d<vec3> bone_angular_velocities,
+    const slice1d<int> bone_parents)
+{
+    vec3 bone_position;
+    vec3 bone_velocity;
+    quat bone_rotation;
+    vec3 bone_angular_velocity;
+
+    forward_kinematics_velocity(
+        bone_position,
+        bone_velocity,
+        bone_rotation,
+        bone_angular_velocity,
+        bone_positions,
+        bone_velocities,
+        bone_rotations,
+        bone_angular_velocities,
+        bone_parents,
+        bone);
+
+    bone_velocity = quat_mul_vec3(quat_inv(bone_rotations(0)), bone_velocity);
+
+    query(offset + 0) = bone_velocity.x;
+    query(offset + 1) = bone_velocity.y;
+    query(offset + 2) = bone_velocity.z;
+
+    offset += 3;
+}
+
+void query_compute_phase_contact_feature_live(
+    slice1d<float> query,
+    int& offset,
+    const slice1d<float> features,
+    const slice1d<float> features_offset,
+    const slice1d<float> features_scale,
+    const slice1d<bool> contacts)
+{
+    // Keep phase from the current latent/feature state for continuity, but use
+    // the actual current contact bits so retrieval does not get trapped by
+    // stale exemplar contacts.
+    query(offset + 0) = features(offset + 0) * features_scale(offset + 0) + features_offset(offset + 0);
+    query(offset + 1) = features(offset + 1) * features_scale(offset + 1) + features_offset(offset + 1);
+    query(offset + 2) = contacts.size > 0 && contacts(0) ? 1.0f : 0.0f;
+    query(offset + 3) = contacts.size > 1 && contacts(1) ? 1.0f : 0.0f;
+
+    offset += MOTION_MATCH_PHASE_CONTACT_FEATURE_COUNT;
 }
 
 // Compute the query feature vector for the current 
@@ -2667,6 +2863,11 @@ int main(int argc, char** argv)
     array1d<vec3> trns_bone_angular_velocities = db.bone_angular_velocities(frame_index);
     array1d<bool> trns_bone_contacts = db.contact_states(frame_index);
 
+    array1d<vec3> prev_lmm_bone_positions = curr_bone_positions;
+    array1d<vec3> prev_lmm_bone_velocities = curr_bone_velocities;
+    array1d<quat> prev_lmm_bone_rotations = curr_bone_rotations;
+    array1d<vec3> prev_lmm_bone_angular_velocities = curr_bone_angular_velocities;
+
     array1d<vec3> bone_positions = db.bone_positions(frame_index);
     array1d<vec3> bone_velocities = db.bone_velocities(frame_index);
     array1d<quat> bone_rotations = db.bone_rotations(frame_index);
@@ -2760,7 +2961,6 @@ int main(int argc, char** argv)
     float simulation_walk_back_speed = 1.25f;
     bool simulation_follow_animation_speed = true;
     float lmm_projector_transition_threshold = 0.10f;
-    float lmm_projector_blend_halflife = 0.06f;
     float trajectory_prediction_dt = g_terrain_sampling_config.prediction_frame_step * (1.0f / 60.0f);
     
     array1d<vec3> trajectory_desired_velocities(prediction_sample_count());
@@ -2927,10 +3127,20 @@ int main(int argc, char** argv)
     array1d<bool> eval_prev_contact_valid(contact_bones.size);
     eval_prev_contact_positions.zero();
     eval_prev_contact_valid.set(false);
+    array1d<vec3> runtime_prev_contact_targets(contact_bones.size);
+    array1d<vec3> runtime_prev_contact_anchor_positions(contact_bones.size);
+    array1d<bool> runtime_prev_contact_target_valid(contact_bones.size);
+    runtime_prev_contact_targets.zero();
+    runtime_prev_contact_anchor_positions.zero();
+    runtime_prev_contact_target_valid.set(false);
     int exemplar_dwell_frames = 1000000;
     float runtime_prev_contact_slip = 0.0f;
     float runtime_prev_contact_height_error = 0.0f;
     int runtime_prev_terrain_penetrations = 0;
+    bool runtime_prev_severe_penetration = false;
+    int runtime_penetration_streak = 0;
+    int runtime_reanchor_cooldown = 0;
+    int runtime_hard_reset_cooldown = 0;
     bool runtime_emergency_reanchor = false;
     
     // Go
@@ -2949,6 +3159,8 @@ int main(int argc, char** argv)
     desired_rotation_change_curr = vec3();
     desired_rotation_change_prev = vec3();
     lmm_enabled = g_eval_config.enabled ? (g_eval_config.use_learned && lmm_networks_compatible) : lmm_enabled;
+    bool runtime_trace_enabled = g_eval_config.enabled || g_capture_config.enabled;
+    std::string runtime_trace_path = g_eval_config.enabled ? g_eval_config.trace_path : g_capture_config.trace_path;
     if (g_eval_config.enabled)
     {
         terrain_preview_enabled = false;
@@ -2956,19 +3168,41 @@ int main(int argc, char** argv)
         debug_draw_skeleton = false;
         debug_draw_bind_skeleton = false;
         debug_draw_bind_mesh = false;
-        eval_trace = fopen(g_eval_config.trace_path.c_str(), "w");
+    }
+    if (runtime_trace_enabled)
+    {
+        eval_trace = fopen(runtime_trace_path.c_str(), "w");
         assert(eval_trace != NULL);
+        setvbuf(eval_trace, NULL, _IOLBF, 0);
             fprintf(
                 eval_trace,
                 "frame,time,root_x,root_y,root_z,teacher_frame,selected_exemplar,exemplar_valid,switch_flag,divergence_flag,"
                 "residual_norm_before,residual_norm_after,stepper_input_norm,stepper_output_norm,decompressor_input_norm,"
-                "root_planar_speed,contact_height_error,contact_slip,terrain_penetrations,correction_magnitude,stepper_drift,"
+                "root_planar_speed,desired_speed,sim_root_distance,root_yaw,simulation_yaw,desired_yaw,yaw_error,root_angular_speed_y,simulation_angular_speed_y,"
+                "contact_height_error,contact_slip,terrain_penetrations,correction_magnitude,stepper_drift,"
                 "switch_severity,residual_carry_alpha,selector_margin,exemplar_dwell_frames,emergency_reanchor,hard_reset,"
+                "root_adjust_position_delta,root_adjust_rotation_delta,root_adjust_count,learned_pose_transition,"
+                "hard_reset_cooldown,penetration_streak,penetration_ratio,severe_runtime_penetration,"
+                "switch_blocked_yaw,switch_blocked_cooldown,left_contact_target_step,right_contact_target_step,left_contact_position_step,right_contact_position_step,"
+                "left_contact,right_contact,left_lock,right_lock,"
                 "finite_query,finite_features,finite_latent,finite_residual,finite_stepper,finite_decompressor,finite_pose,mode,selector_mode,residual_mode\n");
     }
 
     auto update_func = [&]()
     {
+        float root_adjust_position_delta = 0.0f;
+        float root_adjust_rotation_delta = 0.0f;
+        int root_adjust_count = 0;
+        bool learned_pose_transition = false;
+        bool switch_blocked_yaw = false;
+        bool switch_blocked_cooldown = false;
+        float penetration_ratio = 0.0f;
+        bool severe_runtime_penetration = false;
+        float left_contact_target_step = 0.0f;
+        float right_contact_target_step = 0.0f;
+        float left_contact_position_step = 0.0f;
+        float right_contact_position_step = 0.0f;
+
         if (IsKeyPressed(KEY_T))
         {
             terrain_preview_enabled = !terrain_preview_enabled;
@@ -3138,20 +3372,44 @@ int main(int argc, char** argv)
         slice1d<float> query_features = lmm_enabled ? slice1d<float>(features_curr) : db.features(frame_index);
 
         int offset = 0;
-        query_copy_denormalized_feature(query, offset, 3, query_features, db.features_offset, db.features_scale); // Left Foot Position
-        query_copy_denormalized_feature(query, offset, 3, query_features, db.features_offset, db.features_scale); // Right Foot Position
-        query_copy_denormalized_feature(query, offset, 3, query_features, db.features_offset, db.features_scale); // Left Foot Velocity
-        query_copy_denormalized_feature(query, offset, 3, query_features, db.features_offset, db.features_scale); // Right Foot Velocity
-        query_copy_denormalized_feature(query, offset, 3, query_features, db.features_offset, db.features_scale); // Hip Velocity
+        if (lmm_enabled)
+        {
+            query_compute_bone_position_feature_live(query, offset, Bone_LeftFoot, bone_positions, bone_rotations, db.bone_parents);
+            query_compute_bone_position_feature_live(query, offset, Bone_RightFoot, bone_positions, bone_rotations, db.bone_parents);
+            query_compute_bone_velocity_feature_live(query, offset, Bone_LeftFoot, bone_positions, bone_velocities, bone_rotations, bone_angular_velocities, db.bone_parents);
+            query_compute_bone_velocity_feature_live(query, offset, Bone_RightFoot, bone_positions, bone_velocities, bone_rotations, bone_angular_velocities, db.bone_parents);
+            query_compute_bone_velocity_feature_live(query, offset, Bone_Hips, bone_positions, bone_velocities, bone_rotations, bone_angular_velocities, db.bone_parents);
+        }
+        else
+        {
+            query_copy_denormalized_feature(query, offset, 3, query_features, db.features_offset, db.features_scale); // Left Foot Position
+            query_copy_denormalized_feature(query, offset, 3, query_features, db.features_offset, db.features_scale); // Right Foot Position
+            query_copy_denormalized_feature(query, offset, 3, query_features, db.features_offset, db.features_scale); // Left Foot Velocity
+            query_copy_denormalized_feature(query, offset, 3, query_features, db.features_offset, db.features_scale); // Right Foot Velocity
+            query_copy_denormalized_feature(query, offset, 3, query_features, db.features_offset, db.features_scale); // Hip Velocity
+        }
         query_compute_trajectory_position_feature(query, offset, bone_positions(0), bone_rotations(0), trajectory_positions);
         query_compute_trajectory_direction_feature(query, offset, bone_rotations(0), trajectory_rotations);
-        query_copy_denormalized_feature(
-            query,
-            offset,
-            MOTION_MATCH_PHASE_CONTACT_FEATURE_COUNT,
-            query_features,
-            db.features_offset,
-            db.features_scale); // Phase sin/cos + contact state
+        if (lmm_enabled)
+        {
+            query_compute_phase_contact_feature_live(
+                query,
+                offset,
+                query_features,
+                db.features_offset,
+                db.features_scale,
+                curr_bone_contacts);
+        }
+        else
+        {
+            query_copy_denormalized_feature(
+                query,
+                offset,
+                MOTION_MATCH_PHASE_CONTACT_FEATURE_COUNT,
+                query_features,
+                db.features_offset,
+                db.features_scale); // Phase sin/cos + contact state
+        }
         if (offset < db.nfeatures())
         {
             query_compute_environment_feature(
@@ -3187,6 +3445,9 @@ int main(int argc, char** argv)
         float selector_margin = 0.0f;
         bool emergency_reanchor = runtime_emergency_reanchor;
         bool hard_reset = false;
+        float runtime_yaw_error = angle_diff(
+            yaw_from_quat(simulation_rotation),
+            yaw_from_quat(bone_rotations(0)));
         bool exemplar_valid = exemplar_index >= 0 && exemplar_index < db.nframes() &&
             (db.searchable_frames.size != db.nframes() || db.searchable_frames(exemplar_index));
 
@@ -3210,7 +3471,7 @@ int main(int argc, char** argv)
             bool do_search =
                 search_timer <= 0.0f ||
                 force_search ||
-                emergency_reanchor ||
+                (emergency_reanchor && runtime_hard_reset_cooldown <= 0) ||
                 exemplar_index == -1 ||
                 teacher_end_of_anim ||
                 exemplar_end_of_anim;
@@ -3276,9 +3537,17 @@ int main(int argc, char** argv)
                 {
                     selector_margin = HYBRID_SELECTOR_SCORE_MARGIN;
                     bool dwell_locked = exemplar_dwell_frames < HYBRID_SELECTOR_MIN_DWELL_FRAMES;
-                    if (!emergency_reanchor &&
-                        best_score < current_score + selector_margin &&
-                        dwell_locked)
+                    bool cooldown_locked = runtime_hard_reset_cooldown > 0;
+                    bool yaw_locked = fabsf(runtime_yaw_error) > HYBRID_YAW_SWITCH_FREEZE;
+                    switch_blocked_cooldown = cooldown_locked;
+                    switch_blocked_yaw = yaw_locked;
+                    if (cooldown_locked || yaw_locked)
+                    {
+                        selected_index = exemplar_index;
+                    }
+                    else if (!emergency_reanchor &&
+                             best_score < current_score + selector_margin &&
+                             dwell_locked)
                     {
                         selected_index = exemplar_index;
                     }
@@ -3344,15 +3613,20 @@ int main(int argc, char** argv)
 
                         bool contact_mode_changed =
                             contact_state_mismatch(curr_bone_contacts, db.contact_states(exemplar_index)) > 0.5f;
-                        if (emergency_reanchor ||
-                            runtime_prev_contact_slip > HYBRID_CONTACT_SLIP_HARD_RESET ||
-                            runtime_prev_terrain_penetrations > 0 ||
+                        bool penetration_reanchor_only =
+                            runtime_prev_severe_penetration &&
+                            runtime_prev_contact_slip <= HYBRID_CONTACT_SLIP_HARD_RESET;
+                        if (runtime_prev_contact_slip > HYBRID_CONTACT_SLIP_HARD_RESET ||
                             residual_norm_before > HYBRID_RESIDUAL_NORM_MAX * 0.9f ||
                             switch_severity >= HYBRID_SWITCH_HARD_SEVERITY ||
                             contact_mode_changed)
                         {
                             residual_carry_alpha = 0.0f;
                             hard_reset = true;
+                        }
+                        else if (emergency_reanchor || penetration_reanchor_only)
+                        {
+                            residual_carry_alpha = 0.0f;
                         }
                         else if (switch_severity >= HYBRID_SWITCH_MEDIUM_SEVERITY ||
                                  runtime_prev_contact_slip > HYBRID_CONTACT_SLIP_GUARD ||
@@ -3419,11 +3693,14 @@ int main(int argc, char** argv)
 
                     residual_norm_before = hybrid_residual_norm(residual_features, residual_latent);
                     if (runtime_prev_contact_slip > HYBRID_CONTACT_SLIP_HARD_RESET ||
-                        runtime_prev_terrain_penetrations > 0 ||
                         residual_norm_before > HYBRID_RESIDUAL_NORM_MAX * 0.9f)
                     {
                         residual_carry_alpha = 0.0f;
                         hard_reset = true;
+                    }
+                    else if (runtime_prev_severe_penetration)
+                    {
+                        residual_carry_alpha = 0.0f;
                     }
                     else if (runtime_prev_contact_slip > HYBRID_CONTACT_SLIP_GUARD ||
                              residual_norm_before > HYBRID_RESIDUAL_NORM_P99 * 2.0f)
@@ -3535,6 +3812,11 @@ int main(int argc, char** argv)
 
         if (lmm_enabled && lmm_networks_compatible)
         {
+            prev_lmm_bone_positions = curr_bone_positions;
+            prev_lmm_bone_velocities = curr_bone_velocities;
+            prev_lmm_bone_rotations = curr_bone_rotations;
+            prev_lmm_bone_angular_velocities = curr_bone_angular_velocities;
+
             for (int i = 0; i < stepper_control.size; i++)
             {
                 stepper_control(i) = features_curr(15 + i);
@@ -3631,6 +3913,69 @@ int main(int argc, char** argv)
                 curr_bone_rotations(0),
                 decompressor,
                 dt);
+
+            float learned_root_speed = planar_speed(curr_bone_velocities(0));
+            float learned_root_step_speed = planar_speed(curr_bone_positions(0) - prev_lmm_bone_positions(0)) / maxf(dt, 1e-5f);
+            bool learned_target_invalid =
+                !vec3_array_is_finite(curr_bone_positions) ||
+                !vec3_array_is_finite(curr_bone_velocities) ||
+                !quat_array_is_finite(curr_bone_rotations) ||
+                !vec3_array_is_finite(curr_bone_angular_velocities) ||
+                learned_root_speed > db.root_speed_limit * 2.0f ||
+                learned_root_step_speed > db.root_speed_limit * 2.0f ||
+                fabsf(curr_bone_positions(0).y - prev_lmm_bone_positions(0).y) > 0.5f;
+
+            if (learned_target_invalid && exemplar_index >= 0)
+            {
+                curr_bone_positions = db.bone_positions(exemplar_index);
+                curr_bone_velocities = db.bone_velocities(exemplar_index);
+                curr_bone_rotations = db.bone_rotations(exemplar_index);
+                curr_bone_angular_velocities = db.bone_angular_velocities(exemplar_index);
+                curr_bone_contacts = db.contact_states(exemplar_index);
+
+                features_curr = db.features(exemplar_index);
+                for (int i = 0; i < latent_curr.size; i++)
+                {
+                    latent_curr(i) = latent_database(exemplar_index, i);
+                }
+                residual_features.zero();
+                residual_latent.zero();
+                hard_reset = true;
+                emergency_reanchor = true;
+                runtime_emergency_reanchor = true;
+            }
+
+            bool learned_pose_transition_now =
+                switch_flag &&
+                (switch_severity >= HYBRID_SWITCH_MEDIUM_SEVERITY ||
+                 projector_correction_mag >= lmm_projector_transition_threshold);
+
+            learned_pose_transition = learned_pose_transition_now;
+
+            if (learned_pose_transition_now)
+            {
+                inertialize_pose_transition(
+                    bone_offset_positions,
+                    bone_offset_velocities,
+                    bone_offset_rotations,
+                    bone_offset_angular_velocities,
+                    transition_src_position,
+                    transition_src_rotation,
+                    transition_dst_position,
+                    transition_dst_rotation,
+                    bone_positions(0),
+                    bone_velocities(0),
+                    bone_rotations(0),
+                    bone_angular_velocities(0),
+                    prev_lmm_bone_positions,
+                    prev_lmm_bone_velocities,
+                    prev_lmm_bone_rotations,
+                    prev_lmm_bone_angular_velocities,
+                    curr_bone_positions,
+                    curr_bone_velocities,
+                    curr_bone_rotations,
+                    curr_bone_angular_velocities);
+            }
         }
         else
         {
@@ -3716,6 +4061,14 @@ int main(int argc, char** argv)
             
             simulation_position = synchronized_position;
             simulation_rotation = synchronized_rotation;
+
+            root_adjust_position_delta = maxf(
+                root_adjust_position_delta,
+                length(synchronized_position - bone_positions(0)));
+            root_adjust_rotation_delta = maxf(
+                root_adjust_rotation_delta,
+                quat_angle_between(bone_rotations(0), synchronized_rotation));
+            root_adjust_count += 1;
             
             inertialize_root_adjust(
                 bone_offset_positions(0),
@@ -3729,75 +4082,74 @@ int main(int argc, char** argv)
                 synchronized_rotation);
         }
         
-        // Adjustment 
-        
-        if (!synchronization_enabled && adjustment_enabled)
-        {   
-            vec3 adjusted_position = bone_positions(0);
-            quat adjusted_rotation = bone_rotations(0);
-            
-            if (adjustment_by_velocity_enabled)
-            {
-                adjusted_position = adjust_character_position_by_velocity(
-                    bone_positions(0),
-                    animation_root_velocity_control,
-                    simulation_position,
-                    adjustment_position_max_ratio,
-                    adjustment_position_halflife,
-                    dt);
-                
-                adjusted_rotation = adjust_character_rotation_by_velocity(
-                    bone_rotations(0),
-                    bone_angular_velocities(0),
-                    simulation_rotation,
-                    adjustment_rotation_max_ratio,
-                    adjustment_rotation_halflife,
-                    dt);
-            }
-            else
-            {
-                adjusted_position = adjust_character_position(
-                    bone_positions(0),
-                    simulation_position,
-                    adjustment_position_halflife,
-                    dt);
-                
-                adjusted_rotation = adjust_character_rotation(
-                    bone_rotations(0),
-                    simulation_rotation,
-                    adjustment_rotation_halflife,
-                    dt);
-            }
-      
-            inertialize_root_adjust(
-                bone_offset_positions(0),
-                transition_src_position,
-                transition_src_rotation,
-                transition_dst_position,
-                transition_dst_rotation,
-                bone_positions(0),
-                bone_rotations(0),
-                adjusted_position,
-                adjusted_rotation);
-        }
-        
-        // Clamping
-        
-        if (!synchronization_enabled && clamping_enabled)
+        // Root correction
+        //
+        // Apply at most one inertialized root correction per frame. The previous
+        // version adjusted toward the simulation and then clamped in a second
+        // pass, which gave the root inertializer two competing targets in the
+        // same frame and could accumulate oscillation.
+        if (!synchronization_enabled && (adjustment_enabled || clamping_enabled))
         {
-            vec3 adjusted_position = bone_positions(0);
-            quat adjusted_rotation = bone_rotations(0);
-            
-            adjusted_position = clamp_character_position(
-                adjusted_position,
-                simulation_position,
-                clamping_max_distance);
-            
-            adjusted_rotation = clamp_character_rotation(
-                adjusted_rotation,
-                simulation_rotation,
-                clamping_max_angle);
-            
+            vec3 corrected_position = bone_positions(0);
+            quat corrected_rotation = bone_rotations(0);
+
+            if (adjustment_enabled)
+            {
+                if (adjustment_by_velocity_enabled)
+                {
+                    corrected_position = adjust_character_position_by_velocity(
+                        corrected_position,
+                        animation_root_velocity_control,
+                        simulation_position,
+                        adjustment_position_max_ratio,
+                        adjustment_position_halflife,
+                        dt);
+
+                    corrected_rotation = adjust_character_rotation_by_velocity(
+                        corrected_rotation,
+                        bone_angular_velocities(0),
+                        simulation_rotation,
+                        adjustment_rotation_max_ratio,
+                        adjustment_rotation_halflife,
+                        dt);
+                }
+                else
+                {
+                    corrected_position = adjust_character_position(
+                        corrected_position,
+                        simulation_position,
+                        adjustment_position_halflife,
+                        dt);
+
+                    corrected_rotation = adjust_character_rotation(
+                        corrected_rotation,
+                        simulation_rotation,
+                        adjustment_rotation_halflife,
+                        dt);
+                }
+            }
+
+            if (clamping_enabled)
+            {
+                corrected_position = clamp_character_position(
+                    corrected_position,
+                    simulation_position,
+                    clamping_max_distance);
+
+                corrected_rotation = clamp_character_rotation(
+                    corrected_rotation,
+                    simulation_rotation,
+                    clamping_max_angle);
+            }
+
+            root_adjust_position_delta = maxf(
+                root_adjust_position_delta,
+                length(corrected_position - bone_positions(0)));
+            root_adjust_rotation_delta = maxf(
+                root_adjust_rotation_delta,
+                quat_angle_between(bone_rotations(0), corrected_rotation));
+            root_adjust_count += 1;
+
             inertialize_root_adjust(
                 bone_offset_positions(0),
                 transition_src_position,
@@ -3806,8 +4158,8 @@ int main(int argc, char** argv)
                 transition_dst_rotation,
                 bone_positions(0),
                 bone_rotations(0),
-                adjusted_position,
-                adjusted_rotation);
+                corrected_position,
+                corrected_rotation);
         }
 
         bool startup_bootstrap_active =
@@ -3832,6 +4184,13 @@ int main(int argc, char** argv)
             if (fabsf(root_offset_y) > 1e-4f)
             {
                 vec3 bootstrap_position = bone_positions(0) + vec3(0.0f, root_offset_y, 0.0f);
+                root_adjust_position_delta = maxf(
+                    root_adjust_position_delta,
+                    length(bootstrap_position - bone_positions(0)));
+                root_adjust_rotation_delta = maxf(
+                    root_adjust_rotation_delta,
+                    quat_angle_between(bone_rotations(0), bone_rotations(0)));
+                root_adjust_count += 1;
                 inertialize_root_adjust(
                     bone_offset_positions(0),
                     transition_src_position,
@@ -4032,6 +4391,29 @@ int main(int argc, char** argv)
                     toe_end_targ);
             }
         }
+
+        for (int i = 0; i < contact_bones.size; i++)
+        {
+            if (runtime_prev_contact_target_valid(i))
+            {
+                float target_step = length(contact_targets(i) - runtime_prev_contact_targets(i));
+                float position_step = length(contact_positions(i) - runtime_prev_contact_anchor_positions(i));
+                if (i == 0)
+                {
+                    left_contact_target_step = target_step;
+                    left_contact_position_step = position_step;
+                }
+                else if (i == 1)
+                {
+                    right_contact_target_step = target_step;
+                    right_contact_position_step = position_step;
+                }
+            }
+
+            runtime_prev_contact_targets(i) = contact_targets(i);
+            runtime_prev_contact_anchor_positions(i) = contact_positions(i);
+            runtime_prev_contact_target_valid(i) = true;
+        }
         
         // Full pass of forward kinematics to compute 
         // all bone positions and rotations in the world
@@ -4089,19 +4471,54 @@ int main(int argc, char** argv)
         runtime_prev_contact_slip = contact_slip;
         runtime_prev_contact_height_error = contact_height_error;
         runtime_prev_terrain_penetrations = terrain_penetrations;
+        penetration_ratio =
+            active_contacts > 0 ? (float)terrain_penetrations / (float)active_contacts : 0.0f;
         bool severe_penetration =
             active_contacts > 0 &&
-            (float)terrain_penetrations / (float)active_contacts > 0.5f &&
+            penetration_ratio > 0.5f &&
             contact_height_error > STARTUP_SEVERE_PENETRATION;
+        severe_runtime_penetration =
+            active_contacts > 0 &&
+            penetration_ratio > HYBRID_RUNTIME_PENETRATION_RATIO_GUARD &&
+            contact_height_error > HYBRID_RUNTIME_PENETRATION_HEIGHT_GUARD;
+        runtime_penetration_streak =
+            severe_runtime_penetration ? (runtime_penetration_streak + 1) : 0;
+        runtime_prev_severe_penetration =
+            runtime_penetration_streak >= HYBRID_RUNTIME_PENETRATION_STREAK_FRAMES;
+        bool penetration_reanchor_event = false;
+        if (!startup_bootstrap_active && runtime_prev_severe_penetration && runtime_reanchor_cooldown <= 0)
+        {
+            penetration_reanchor_event = true;
+            runtime_reanchor_cooldown = HYBRID_RUNTIME_REANCHOR_COOLDOWN_FRAMES;
+        }
         runtime_emergency_reanchor =
             startup_bootstrap_active ?
             severe_penetration :
             (contact_slip > HYBRID_CONTACT_SLIP_HARD_RESET ||
-             terrain_penetrations > 0 ||
+             penetration_reanchor_event ||
              hybrid_residual_norm(residual_features, residual_latent) > HYBRID_RESIDUAL_NORM_MAX * 0.9f);
 
-        if (g_eval_config.enabled && eval_trace != NULL)
+        if (runtime_reanchor_cooldown > 0 && !penetration_reanchor_event)
         {
+            runtime_reanchor_cooldown--;
+        }
+
+        if (hard_reset)
+        {
+            runtime_hard_reset_cooldown = HYBRID_HARD_RESET_COOLDOWN_FRAMES;
+        }
+        else if (runtime_hard_reset_cooldown > 0)
+        {
+            runtime_hard_reset_cooldown--;
+        }
+
+        if (runtime_trace_enabled && eval_trace != NULL)
+        {
+            float root_yaw = yaw_from_quat(bone_rotations(0));
+            float simulation_yaw = yaw_from_quat(simulation_rotation);
+            float desired_yaw = yaw_from_quat(desired_rotation);
+            float desired_speed = planar_speed(desired_velocity);
+            float simulation_distance = planar_speed(bone_positions(0) - simulation_position);
 
             runtime_debug_snapshot snapshot;
             snapshot.frame = eval_frame_index;
@@ -4115,14 +4532,38 @@ int main(int argc, char** argv)
             snapshot.stepper_output_norm = stepper_output_norm;
             snapshot.decompressor_input_norm = decompressor_input_norm;
             snapshot.root_planar_speed = planar_speed(bone_velocities(0));
+            snapshot.desired_speed = desired_speed;
+            snapshot.simulation_distance = simulation_distance;
+            snapshot.root_yaw = root_yaw;
+            snapshot.simulation_yaw = simulation_yaw;
+            snapshot.desired_yaw = desired_yaw;
+            snapshot.yaw_error = angle_diff(simulation_yaw, root_yaw);
+            snapshot.root_angular_speed_y = bone_angular_velocities(0).y;
+            snapshot.simulation_angular_speed_y = simulation_angular_velocity.y;
             snapshot.contact_slip = contact_slip;
+            snapshot.contact_height_error = contact_height_error;
+            snapshot.penetration_ratio = penetration_ratio;
+            snapshot.terrain_penetrations = terrain_penetrations;
             snapshot.correction_magnitude = projector_correction_mag;
+            snapshot.root_adjust_position_delta = root_adjust_position_delta;
+            snapshot.root_adjust_rotation_delta = root_adjust_rotation_delta;
+            snapshot.root_adjust_count = root_adjust_count;
             snapshot.switch_severity = switch_severity;
             snapshot.residual_carry_alpha = residual_carry_alpha;
             snapshot.selector_margin = selector_margin;
             snapshot.exemplar_dwell_frames = exemplar_dwell_frames;
+            snapshot.hard_reset_cooldown = runtime_hard_reset_cooldown;
+            snapshot.penetration_streak = runtime_penetration_streak;
+            snapshot.severe_runtime_penetration = severe_runtime_penetration;
             snapshot.emergency_reanchor = emergency_reanchor;
             snapshot.hard_reset = hard_reset;
+            snapshot.learned_pose_transition = learned_pose_transition;
+            snapshot.switch_blocked_yaw = switch_blocked_yaw;
+            snapshot.switch_blocked_cooldown = switch_blocked_cooldown;
+            snapshot.left_contact_target_step = left_contact_target_step;
+            snapshot.right_contact_target_step = right_contact_target_step;
+            snapshot.left_contact_position_step = left_contact_position_step;
+            snapshot.right_contact_position_step = right_contact_position_step;
             snapshot.finite_query = array_is_finite(query_normalized);
             snapshot.finite_features = array_is_finite(features_curr);
             snapshot.finite_latent = array_is_finite(latent_curr);
@@ -4180,12 +4621,15 @@ int main(int argc, char** argv)
 
             if (failure_triggered && !failure_dump_written && failure_future_remaining == 0)
             {
-                std::string dump_dir = g_eval_config.failure_dump_dir.empty() ? "." : g_eval_config.failure_dump_dir;
-                std::string dump_path = dump_dir + "/" + g_eval_config.tag + "_failure_dump.txt";
+                std::string dump_dir = g_eval_config.enabled ?
+                    (g_eval_config.failure_dump_dir.empty() ? "." : g_eval_config.failure_dump_dir) :
+                    (g_capture_config.failure_dump_dir.empty() ? "." : g_capture_config.failure_dump_dir);
+                std::string dump_tag = g_eval_config.enabled ? g_eval_config.tag : g_capture_config.tag;
+                std::string dump_path = dump_dir + "/" + dump_tag + "_failure_dump.txt";
                 FILE* dump = fopen(dump_path.c_str(), "w");
                 if (dump != NULL)
                 {
-                    fprintf(dump, "tag=%s selector_mode=%s residual_mode=%s\n", g_eval_config.tag.c_str(), g_eval_config.selector_mode.c_str(), g_eval_config.residual_mode.c_str());
+                    fprintf(dump, "tag=%s selector_mode=%s residual_mode=%s\n", dump_tag.c_str(), g_eval_config.selector_mode.c_str(), g_eval_config.residual_mode.c_str());
                     fprintf(dump, "history\n");
                     for (const runtime_debug_snapshot& item : failure_history)
                     {
@@ -4204,7 +4648,11 @@ int main(int argc, char** argv)
 
             fprintf(
                 eval_trace,
-                "%d,%.6f,%.6f,%.6f,%.6f,%d,%d,%d,%d,%d,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%d,%.6f,%.6f,%.6f,%.6f,%.6f,",
+                "%d,%.6f,%.6f,%.6f,%.6f,%d,%d,%d,%d,%d,"
+                "%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,"
+                "%d,%.6f,%.6f,%.6f,%.6f,%.6f,"
+                "%d,%d,%d,"
+                "%.6f,%.6f,%d,%d,%d,%d,%.6f,%d,%d,%d,%.6f,%.6f,%.6f,%.6f,",
                 eval_frame_index,
                 eval_frame_index * dt,
                 bone_positions(0).x,
@@ -4221,6 +4669,14 @@ int main(int argc, char** argv)
                 stepper_output_norm,
                 decompressor_input_norm,
                 snapshot.root_planar_speed,
+                desired_speed,
+                simulation_distance,
+                root_yaw,
+                simulation_yaw,
+                desired_yaw,
+                snapshot.yaw_error,
+                snapshot.root_angular_speed_y,
+                snapshot.simulation_angular_speed_y,
                 contact_height_error,
                 contact_slip,
                 terrain_penetrations,
@@ -4228,13 +4684,31 @@ int main(int argc, char** argv)
                 stepper_drift_mag,
                 switch_severity,
                 residual_carry_alpha,
-                selector_margin);
-            fprintf(
-                eval_trace,
-                "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%s,%s,%s\n",
+                selector_margin,
                 exemplar_dwell_frames,
                 emergency_reanchor ? 1 : 0,
                 hard_reset ? 1 : 0,
+                root_adjust_position_delta,
+                root_adjust_rotation_delta,
+                root_adjust_count,
+                learned_pose_transition ? 1 : 0,
+                runtime_hard_reset_cooldown,
+                runtime_penetration_streak,
+                penetration_ratio,
+                severe_runtime_penetration ? 1 : 0,
+                switch_blocked_yaw ? 1 : 0,
+                switch_blocked_cooldown ? 1 : 0,
+                left_contact_target_step,
+                right_contact_target_step,
+                left_contact_position_step,
+                right_contact_position_step);
+            fprintf(
+                eval_trace,
+                "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%s,%s,%s\n",
+                curr_bone_contacts.size > 0 ? (curr_bone_contacts(0) ? 1 : 0) : 0,
+                curr_bone_contacts.size > 1 ? (curr_bone_contacts(1) ? 1 : 0) : 0,
+                contact_locks.size > 0 ? (contact_locks(0) ? 1 : 0) : 0,
+                contact_locks.size > 1 ? (contact_locks(1) ? 1 : 0) : 0,
                 snapshot.finite_query ? 1 : 0,
                 snapshot.finite_features ? 1 : 0,
                 snapshot.finite_latent ? 1 : 0,
@@ -4247,7 +4721,7 @@ int main(int argc, char** argv)
                 g_eval_config.residual_mode.c_str());
 
             eval_frame_index++;
-            if (eval_frame_index >= g_eval_config.frames)
+            if (g_eval_config.enabled && eval_frame_index >= g_eval_config.frames)
             {
                 fclose(eval_trace);
                 eval_trace = NULL;
@@ -4393,8 +4867,9 @@ int main(int argc, char** argv)
         //---------
         
         float ui_sim_hei = 20;
-        
-        GuiGroupBox((Rectangle){ 970, ui_sim_hei, 290, 250 }, "simulation object");
+        float ui_sim_height = simulation_follow_animation_speed ? 100.0f : 290.0f;
+
+        GuiGroupBox((Rectangle){ 970, ui_sim_hei, 290, ui_sim_height }, "locomotion");
         GuiCheckBox(
             (Rectangle){ 990, ui_sim_hei + 10, 20, 20 },
             "follow anim speed",
@@ -4411,225 +4886,95 @@ int main(int argc, char** argv)
             "rotation halflife", 
             TextFormat("%5.3f", simulation_rotation_halflife), 
             &simulation_rotation_halflife, 0.0f, 0.5f);
+        
+        if (!simulation_follow_animation_speed)
+        {
+            GuiSliderBar(
+                (Rectangle){ 1100, ui_sim_hei + 70, 120, 20 }, 
+                "run forward", 
+                TextFormat("%5.3f", simulation_run_fwrd_speed), 
+                &simulation_run_fwrd_speed, 0.0f, 10.0f);
             
-        GuiSliderBar(
-            (Rectangle){ 1100, ui_sim_hei + 70, 120, 20 }, 
-            "run forward request", 
-            TextFormat("%5.3f", simulation_run_fwrd_speed), 
-            &simulation_run_fwrd_speed, 0.0f, 10.0f);
-        
-        GuiSliderBar(
-            (Rectangle){ 1100, ui_sim_hei + 100, 120, 20 }, 
-            "run sideways request", 
-            TextFormat("%5.3f", simulation_run_side_speed), 
-            &simulation_run_side_speed, 0.0f, 10.0f);
-        
-        GuiSliderBar(
-            (Rectangle){ 1100, ui_sim_hei + 130, 120, 20 }, 
-            "run backwards request", 
-            TextFormat("%5.3f", simulation_run_back_speed), 
-            &simulation_run_back_speed, 0.0f, 10.0f);
-        
-        GuiSliderBar(
-            (Rectangle){ 1100, ui_sim_hei + 160, 120, 20 }, 
-            "walk forward request", 
-            TextFormat("%5.3f", simulation_walk_fwrd_speed), 
-            &simulation_walk_fwrd_speed, 0.0f, 5.0f);
-        
-        GuiSliderBar(
-            (Rectangle){ 1100, ui_sim_hei + 190, 120, 20 }, 
-            "walk sideways request", 
-            TextFormat("%5.3f", simulation_walk_side_speed), 
-            &simulation_walk_side_speed, 0.0f, 5.0f);
-        
-        GuiSliderBar(
-            (Rectangle){ 1100, ui_sim_hei + 220, 120, 20 }, 
-            "walk backwards request", 
-            TextFormat("%5.3f", simulation_walk_back_speed), 
-            &simulation_walk_back_speed, 0.0f, 5.0f);
-        
+            GuiSliderBar(
+                (Rectangle){ 1100, ui_sim_hei + 100, 120, 20 }, 
+                "run side", 
+                TextFormat("%5.3f", simulation_run_side_speed), 
+                &simulation_run_side_speed, 0.0f, 10.0f);
+            
+            GuiSliderBar(
+                (Rectangle){ 1100, ui_sim_hei + 130, 120, 20 }, 
+                "run back", 
+                TextFormat("%5.3f", simulation_run_back_speed), 
+                &simulation_run_back_speed, 0.0f, 10.0f);
+            
+            GuiSliderBar(
+                (Rectangle){ 1100, ui_sim_hei + 170, 120, 20 }, 
+                "walk forward", 
+                TextFormat("%5.3f", simulation_walk_fwrd_speed), 
+                &simulation_walk_fwrd_speed, 0.0f, 5.0f);
+            
+            GuiSliderBar(
+                (Rectangle){ 1100, ui_sim_hei + 200, 120, 20 }, 
+                "walk side", 
+                TextFormat("%5.3f", simulation_walk_side_speed), 
+                &simulation_walk_side_speed, 0.0f, 5.0f);
+            
+            GuiSliderBar(
+                (Rectangle){ 1100, ui_sim_hei + 230, 120, 20 }, 
+                "walk back", 
+                TextFormat("%5.3f", simulation_walk_back_speed), 
+                &simulation_walk_back_speed, 0.0f, 5.0f);
+        }
+        else
+        {
+            GuiLabel((Rectangle){ 1000, ui_sim_hei + 72, 220, 20 }, "request speeds hidden while following anim");
+        }
+
         //---------
         
-        float ui_inert_hei = 280;
+        float ui_match_hei = ui_sim_hei + ui_sim_height + 10.0f;
         
-        GuiGroupBox((Rectangle){ 970, ui_inert_hei, 290, 40 }, "inertiaization blending");
-        
-        GuiSliderBar(
-            (Rectangle){ 1100, ui_inert_hei + 10, 120, 20 }, 
-            "halflife", 
-            TextFormat("%5.3f", inertialize_blending_halflife), 
-            &inertialize_blending_halflife, 0.0f, 0.3f);
-        
-        //---------
-        
-        float ui_lmm_hei = 330;
-        
-        GuiGroupBox((Rectangle){ 970, ui_lmm_hei, 290, 65 }, "learned motion matching");
+        GuiGroupBox((Rectangle){ 970, ui_match_hei, 290, 100 }, "motion matching");
         
         GuiCheckBox(
-            (Rectangle){ 1000, ui_lmm_hei + 10, 20, 20 }, 
-            "enabled",
+            (Rectangle){ 990, ui_match_hei + 10, 20, 20 }, 
+            "learned",
             &lmm_enabled);
+
         GuiSliderBar(
-            (Rectangle){ 1110, ui_lmm_hei + 10, 110, 20 },
-            "threshold",
+            (Rectangle){ 1100, ui_match_hei + 10, 120, 20 }, 
+            "mm transition", 
+            TextFormat("%5.3f", motion_matching_transition_cost), 
+            &motion_matching_transition_cost, 0.0f, 0.5f);
+
+        GuiSliderBar(
+            (Rectangle){ 1100, ui_match_hei + 40, 120, 20 }, 
+            "inertial halflife", 
+            TextFormat("%5.3f", inertialize_blending_halflife), 
+            &inertialize_blending_halflife, 0.0f, 0.3f);
+
+        GuiSliderBar(
+            (Rectangle){ 1100, ui_match_hei + 70, 120, 20 },
+            "pose transition",
             TextFormat("%5.3f", lmm_projector_transition_threshold),
             &lmm_projector_transition_threshold, 0.0f, 0.5f);
-        GuiSliderBar(
-            (Rectangle){ 1110, ui_lmm_hei + 35, 110, 20 },
-            "blend halflife",
-            TextFormat("%5.3f", lmm_projector_blend_halflife),
-            &lmm_projector_blend_halflife, 0.01f, 0.3f);
+
         if (!lmm_networks_compatible)
         {
-            GuiLabel((Rectangle){ 1065, ui_lmm_hei + 10, 185, 20 }, "retrain nets for env sdf");
+            GuiLabel((Rectangle){ 1000, ui_match_hei + 10, 185, 20 }, "retrain nets for env sdf");
             lmm_enabled = false;
         }
         
         //---------
         
-        float ui_ctrl_hei = 380;
+        float ui_ik_hei = ui_match_hei + 110.0f;
         
-        GuiGroupBox((Rectangle){ 1010, ui_ctrl_hei, 250, 260 }, "controls");
-        GuiLabel((Rectangle){ 1030, ui_ctrl_hei - 20, 210, 20 }, PFNN_HEIGHTMAP_LABEL);
-        GuiLabel((Rectangle){ 1030, ui_ctrl_hei +  20, 200, 20 }, terrain_preview_enabled ? "T Topdown Preview: ON" : "T Topdown Preview: OFF");
-        
-        GuiLabel((Rectangle){ 1030, ui_ctrl_hei +  40, 200, 20 }, "Left Trigger - Strafe");
-        GuiLabel((Rectangle){ 1030, ui_ctrl_hei +  60, 200, 20 }, "WASD / Left Stick - Move");
-        GuiLabel((Rectangle){ 1030, ui_ctrl_hei +  80, 200, 20 }, "RMB / Arrows / Right Stick - Camera");
-        GuiLabel((Rectangle){ 1030, ui_ctrl_hei + 100, 200, 20 }, "Left Shoulder - Zoom In");
-        GuiLabel((Rectangle){ 1030, ui_ctrl_hei + 120, 200, 20 }, "Right Shoulder - Zoom Out");
-        GuiLabel((Rectangle){ 1030, ui_ctrl_hei + 140, 200, 20 }, "A Button - Walk");
-        GuiLabel((Rectangle){ 1030, ui_ctrl_hei + 160, 200, 20 }, debug_draw_mesh ? "M Mesh: ON" : "M Mesh: OFF");
-        GuiLabel((Rectangle){ 1030, ui_ctrl_hei + 180, 200, 20 }, debug_draw_skeleton ? "B Skeleton: ON" : "B Skeleton: OFF");
-        GuiLabel((Rectangle){ 1030, ui_ctrl_hei + 200, 200, 20 }, ik_enabled ? "I IK: ON" : "I IK: OFF");
-        GuiLabel((Rectangle){ 1030, ui_ctrl_hei + 220, 200, 20 }, debug_draw_bind_skeleton ? "N Bind Skeleton: ON" : "N Bind Skeleton: OFF");
-        GuiLabel((Rectangle){ 1030, ui_ctrl_hei + 240, 200, 20 }, debug_draw_bind_mesh ? "R Bind Mesh: ON" : "R Bind Mesh: OFF");
-        
-
-        
-        //---------
-        
-        GuiGroupBox((Rectangle){ 20, 20, 290, 220 }, "feature weights");
-        
-        GuiSliderBar(
-            (Rectangle){ 150, 30, 120, 20 }, 
-            "foot position", 
-            TextFormat("%5.3f", feature_weight_foot_position), 
-            &feature_weight_foot_position, 0.001f, 3.0f);
-            
-        GuiSliderBar(
-            (Rectangle){ 150, 60, 120, 20 }, 
-            "foot velocity", 
-            TextFormat("%5.3f", feature_weight_foot_velocity), 
-            &feature_weight_foot_velocity, 0.001f, 3.0f);
-        
-        GuiSliderBar(
-            (Rectangle){ 150, 90, 120, 20 }, 
-            "hip velocity", 
-            TextFormat("%5.3f", feature_weight_hip_velocity), 
-            &feature_weight_hip_velocity, 0.001f, 3.0f);
-        
-        GuiSliderBar(
-            (Rectangle){ 150, 120, 120, 20 }, 
-            "trajectory positions", 
-            TextFormat("%5.3f", feature_weight_trajectory_positions), 
-            &feature_weight_trajectory_positions, 0.001f, 3.0f);
-        
-        GuiSliderBar(
-            (Rectangle){ 150, 150, 120, 20 }, 
-            "trajectory directions", 
-            TextFormat("%5.3f", feature_weight_trajectory_directions), 
-            &feature_weight_trajectory_directions, 0.001f, 3.0f);
-        GuiSliderBar(
-            (Rectangle){ 150, 180, 120, 20 },
-            "environment",
-            TextFormat("%5.3f", feature_weight_environment),
-            &feature_weight_environment, 0.001f, 3.0f);
-            
-        if (GuiButton((Rectangle){ 150, 210, 120, 20 }, "rebuild database"))
-        {
-            rebuild_matching_database();
-        }
-        
-        //---------
-        
-        float ui_sync_hei = 220;
-        
-        GuiGroupBox((Rectangle){ 20, ui_sync_hei, 290, 70 }, "synchronization");
-
-        GuiCheckBox(
-            (Rectangle){ 50, ui_sync_hei + 10, 20, 20 }, 
-            "enabled",
-            &synchronization_enabled);
-
-        GuiSliderBar(
-            (Rectangle){ 150, ui_sync_hei + 40, 120, 20 }, 
-            "data-driven amount", 
-            TextFormat("%5.3f", synchronization_data_factor), 
-            &synchronization_data_factor, 0.0f, 1.0f);
-
-        //---------
-        
-        float ui_adj_hei = 300;
-        
-        GuiGroupBox((Rectangle){ 20, ui_adj_hei, 290, 130 }, "adjustment");
-        
-        GuiCheckBox(
-            (Rectangle){ 50, ui_adj_hei + 10, 20, 20 }, 
-            "enabled",
-            &adjustment_enabled);    
-        
-        GuiCheckBox(
-            (Rectangle){ 50, ui_adj_hei + 40, 20, 20 }, 
-            "clamp to max velocity",
-            &adjustment_by_velocity_enabled);    
-        
-        GuiSliderBar(
-            (Rectangle){ 150, ui_adj_hei + 70, 120, 20 }, 
-            "position halflife", 
-            TextFormat("%5.3f", adjustment_position_halflife), 
-            &adjustment_position_halflife, 0.0f, 0.5f);
-        
-        GuiSliderBar(
-            (Rectangle){ 150, ui_adj_hei + 100, 120, 20 }, 
-            "rotation halflife", 
-            TextFormat("%5.3f", adjustment_rotation_halflife), 
-            &adjustment_rotation_halflife, 0.0f, 0.5f);
-        
-        //---------
-        
-        float ui_clamp_hei = 440;
-        
-        GuiGroupBox((Rectangle){ 20, ui_clamp_hei, 290, 100 }, "clamping");
-        
-        GuiCheckBox(
-            (Rectangle){ 50, ui_clamp_hei + 10, 20, 20 }, 
-            "enabled",
-            &clamping_enabled);      
-        
-        GuiSliderBar(
-            (Rectangle){ 150, ui_clamp_hei + 40, 120, 20 }, 
-            "distance", 
-            TextFormat("%5.3f", clamping_max_distance), 
-            &clamping_max_distance, 0.0f, 0.5f);
-        
-        GuiSliderBar(
-            (Rectangle){ 150, ui_clamp_hei + 70, 120, 20 }, 
-            "angle", 
-            TextFormat("%5.3f", clamping_max_angle), 
-            &clamping_max_angle, 0.0f, PIf);
-        
-        //---------
-        
-        float ui_ik_hei = 550;
-        
-        GuiGroupBox((Rectangle){ 20, ui_ik_hei, 290, 100 }, "inverse kinematics");
+        GuiGroupBox((Rectangle){ 970, ui_ik_hei, 290, 100 }, "contact / ik");
         
         bool ik_enabled_prev = ik_enabled;
         
         GuiCheckBox(
-            (Rectangle){ 50, ui_ik_hei + 10, 20, 20 }, 
+            (Rectangle){ 990, ui_ik_hei + 10, 20, 20 }, 
             "enabled",
             &ik_enabled);      
         
@@ -4671,13 +5016,13 @@ int main(int argc, char** argv)
         }
         
         GuiSliderBar(
-            (Rectangle){ 150, ui_ik_hei + 40, 120, 20 }, 
+            (Rectangle){ 1100, ui_ik_hei + 40, 120, 20 }, 
             "blending halflife", 
             TextFormat("%5.3f", ik_blending_halflife), 
             &ik_blending_halflife, 0.0f, 1.0f);
         
         GuiSliderBar(
-            (Rectangle){ 150, ui_ik_hei + 70, 120, 20 }, 
+            (Rectangle){ 1100, ui_ik_hei + 70, 120, 20 }, 
             "unlock radius", 
             TextFormat("%5.3f", ik_unlock_radius), 
             &ik_unlock_radius, 0.0f, 0.5f);
