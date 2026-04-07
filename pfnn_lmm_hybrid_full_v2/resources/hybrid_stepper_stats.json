@@ -1,0 +1,7 @@
+{
+  "valid_spans": 7165,
+  "window": 6,
+  "control_dim": 46,
+  "input_size": 232,
+  "world_size": 3
+}

@@ -1,0 +1,8 @@
+# Shared terrain-aware sampling configuration.
+# This file is the single source of truth for offline/runtime environment sampling.
+
+environment_horizons=10,20,40,60,80
+matching_trajectory_horizons=20,40,60
+prediction_frame_step=10
+strip_half_width=0.25
+sdf_clamp_distance=2.5

@@ -1,0 +1,10 @@
+{
+  "nframes": 1289997,
+  "valid_frames": 1005046,
+  "top_k": 8,
+  "ignore_surrounding": 20,
+  "query_batch": 4096,
+  "db_chunk": 65536,
+  "world_size": 1,
+  "device_type": "cuda"
+}

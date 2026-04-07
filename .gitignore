@@ -39,6 +39,13 @@ pfnn_lmm_hybrid_full_v1/runtime_debug_v5/traces/
 pfnn_lmm_hybrid_full_v1/runtime_debug_v5/failure_dumps/
 pfnn_lmm_hybrid_full_v1/startup_bootstrap_eval_v1/traces/
 pfnn_lmm_hybrid_full_v1/startup_bootstrap_eval_v1/failure_dumps/
+pfnn_lmm_hybrid_full_v2/logs/
+pfnn_lmm_hybrid_full_v2/resources/runs/
+pfnn_lmm_hybrid_full_v2/resources/*.png
+pfnn_lmm_hybrid_full_v2/resources/*.bvh
+pfnn_lmm_hybrid_full_v2/eval/eval_plots/
+pfnn_lmm_hybrid_full_v2/eval/traces/
+pfnn_lmm_hybrid_full_v2/captures/
 pfnn_lmm_*/controller*
 !pfnn_lmm_aligned_full_v3/resources/
 pfnn_lmm_aligned_full_v3/resources/*

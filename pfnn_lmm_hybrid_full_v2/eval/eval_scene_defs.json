@@ -1,0 +1,42 @@
+[
+  {
+    "name": "flat",
+    "start_x": 18.337762026607237,
+    "start_z": -37.76267788300456,
+    "start_yaw": 0.0,
+    "frames": 720,
+    "script_name": "flat.csv"
+  },
+  {
+    "name": "uphill",
+    "start_x": -40.6585178135828,
+    "start_z": -143.03381411500555,
+    "start_yaw": -1.9584167702708506,
+    "frames": 720,
+    "script_name": "uphill.csv"
+  },
+  {
+    "name": "downhill",
+    "start_x": -40.6585178135828,
+    "start_z": -143.03381411500555,
+    "start_yaw": 1.1831758833189425,
+    "frames": 720,
+    "script_name": "downhill.csv"
+  },
+  {
+    "name": "rough",
+    "start_x": -40.10715071227261,
+    "start_z": -157.89562158305276,
+    "start_yaw": -1.5665329255940212,
+    "frames": 720,
+    "script_name": "rough.csv"
+  },
+  {
+    "name": "obstacle",
+    "start_x": 1.75,
+    "start_z": -2.75,
+    "start_yaw": 0.0,
+    "frames": 720,
+    "script_name": "obstacle.csv"
+  }
+]
